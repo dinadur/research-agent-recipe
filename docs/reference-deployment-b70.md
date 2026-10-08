@@ -81,9 +81,10 @@ Model: [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash), converted to 
 llama-server with `-c 2048 -np 1 -b 1024 -ub 1024 -ngl 99`, behind the Clef adapter at threshold 0.85. Latency p50
 was 0.54 s on the offline set, and about 0.4-1.0 s per claim live.
 
-**VRAM.** With the worker and the judge resident, the second card reported 0.14 GB free of 34.24 GB. That is why
-the judge's batch stays at 1024 tokens. Any setting that grows buffers on that card (a larger judge batch, more
-worker slots) needs a VRAM plan first.
+**VRAM.** The main card is nearly full by design: vLLM reserves 96.5% of it (`--gpu-memory-utilization 0.965`), and
+Level Zero reports about 0.14 GB free there. The second card, with the worker and the judge resident, uses about
+20 GB of 34 GB. A larger judge batch (`-b/-ub 2048`) or a bigger judge quant therefore fits on the second card. Do not
+start extra llama.cpp servers on the main card: next to vLLM they fail to allocate.
 
 ## systemd layout
 
