@@ -1,0 +1,198 @@
+From 1b113af56c5c12fdd19439a7d168d1a8b56b5a3a Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:34:11 +0000
+Subject: [PATCH 17/18] B70: open-ended product receipts judge every researched
+ candidate
+
+All four open-ended withholds in the 2026-10-07 fresh 20-prompt run were
+receipt-viability failures. Three were mis-scored:
+
+- Official pages were whatever host the query text named. Editorial pages
+  (reviews, best-of lists, comparisons), review publishers and retailers are
+  now never official (blenderwise.com/best-blender-under-200 and soundguys
+  were; soundguys then left the independent pool).
+- A manufacturer page whose URL path names the model (tp-link.com/.../
+  archer-be9700/, sharkninja.com/.../BL770.html) counts as official when no
+  query-named official page matched the candidate.
+- Viability judged only the candidate behind the last extraction; the model
+  then researches alternatives. If that candidate fails, any other searched
+  candidate that is fully evidenced carries the receipt (logged).
+
+Viability replay over all 74 product turns since 2026-10-07 15:50: 4 not-ready
+turns become ready (official pages accepted: tp-link.com, sharkninja.com,
+jbl.com), 0 ready turns regress.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 79 +++++++++++++++++++++++-
+ tests/agent/test_product_repair_fetch.py | 42 +++++++++++++
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index f36b00843..ad59c56aa 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -1301,6 +1301,47 @@ def _product_query_candidate_tokens(
+     return tokens
+ 
+ 
++# Editorial pages (reviews, "best of" lists, comparisons) are never the
++# manufacturer's official page, whatever the query named (2026-10-07:
++# blenderwise.com/best-blender-under-200 and soundguys reviews were counted
++# as official because the query text contained their host names).
++_EDITORIAL_PATH_RE = re.compile(
++    r"(?:^|[/_.-])(?:reviews?|best|vs|versus|blogs?|guides?|roundups?|compare|"
++    r"comparisons?|picks|top-?\d+|buying-guide)(?:$|[/_.-])",
++    re.IGNORECASE,
++)
++_REVIEW_PUBLISHER_HOST_TOKENS = (
++    "soundguys", "pcmag", "cnet", "tomsguide", "tomshardware", "techradar",
++    "theverge", "wired", "nytimes", "pcgamer", "engadget", "zdnet", "gizmodo",
++    "digitaltrends", "whathifi", "cnn", "foodandwine", "seriouseats",
++    "bonappetit", "epicurious", "thekitchn", "goodhousekeeping", "popsci",
++    "techgearlab", "consumerreports", "wirecutter", "rtings", "forbes",
++    "businessinsider", "usatoday", "theguardian", "bbc", "independent",
++    # retailers not in the shared retailer list
++    "everythingkitchens", "crutchfield", "newegg", "adorama", "costco",
++    "samsclub", "kohls", "macys", "staples", "officedepot", "williams-sonoma",
++    "surlatable", "qvc", "hsn", "overstock", "microcenter", "abt.com", "ajmadison",
++)
++
++
++def _product_url_never_official(url: str) -> bool:
++    host = _host(url)
++    if any(token in host for token in _OFFICIAL_FORBIDDEN_HOST_TOKENS):
++        return True
++    if any(token in host for token in _INDEPENDENT_FORBIDDEN_HOST_TOKENS):
++        return True
++    if any(token in host for token in _REVIEW_PUBLISHER_HOST_TOKENS):
++        return True
++    return bool(_EDITORIAL_PATH_RE.search(urlsplit(url).path))
++
++
++def _product_path_names_model(url: str, distinctive_tokens: set[str]) -> bool:
++    """The URL path itself carries a distinctive model token (be9700, bl770)."""
++
++    path = _normalized_token(urlsplit(url).path)
++    return any(len(token) >= 4 and token in path for token in distinctive_tokens)
++
++
+ def _product_candidate_match(
+     candidate_tokens: set[str], url: str, content: str
+ ) -> bool:
+@@ -1412,8 +1453,10 @@ def _product_source_mix_state(
+     for query, urls in records:
+         for url in urls:
+             canonical = _canonical_url(url)
+-            if canonical in successful and _product_query_targets_source_host(
+-                query, url
++            if (
++                canonical in successful
++                and _product_query_targets_source_host(query, url)
++                and not _product_url_never_official(canonical)
+             ):
+                 focused_sources.add(canonical)
+ 
+@@ -1440,6 +1483,18 @@ def _product_source_mix_state(
+             for url in focused_sources
+             if _product_candidate_match(candidate_tokens, url, source_texts[url])
+         }
++        if not product_focused_sources:
++            # A manufacturer page whose path names the model is official even
++            # when the query did not name its host (tp-link.com/.../archer-be9700/).
++            # Only as a fallback: otherwise a retailer path naming the model
++            # would leave the independent pool (everythingkitchens.com/...e310).
++            product_focused_sources = {
++                url
++                for url, content in source_texts.items()
++                if not _product_url_never_official(url)
++                and _product_path_names_model(url, distinctive_candidate_tokens)
++                and _product_candidate_match(candidate_tokens, url, content)
++            }
+         official_families = {
+             _product_source_family(url)
+             for url in product_focused_sources
+@@ -1496,6 +1551,7 @@ def _product_source_mix_state(
+         "brand_focused_sources": focused_sources,
+         "search_records": records,
+         "search_result_sources": search_result_sources,
++        "candidate_packets": candidate_packets,
+         "candidate_query": candidate_packet.get("candidate_query", ""),
+         "candidate_tokens": candidate_packet.get("candidate_tokens", set()),
+         "product_focused_sources": candidate_packet.get(
+@@ -2031,6 +2087,25 @@ def _product_receipt_viability(
+         )
+     ):
+         reasons.append("candidate_budget_missing")
++    if reasons and not quality_multi_target and not mix.get("_alternative_candidate"):
++        # The model researches alternatives after its leading pick; judging
++        # only the last-searched product withheld packets in which an earlier
++        # candidate was fully evidenced (2026-10-08: the router turn had the
++        # Archer BE9700 official page plus four independent reviews).
++        for packet in mix.get("candidate_packets") or ():
++            if packet.get("candidate_query") == mix.get("candidate_query"):
++                continue
++            alternative = dict(mix, **packet, _alternative_candidate=True)
++            ok, _ = _product_receipt_viability(alternative, original_request)
++            if ok:
++                logger.info(
++                    "Product research receipt viable through an earlier candidate: "
++                    "query=%r (latest %r failed: %s)",
++                    str(packet.get("candidate_query"))[:120],
++                    str(mix.get("candidate_query"))[:120],
++                    ",".join(reasons),
++                )
++                return True, ()
+     return not reasons, tuple(reasons)
+ 
+ 
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index 429f0957d..bf557bdac 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -308,3 +308,45 @@ def test_quality_first_validation_unlinks_outside_citation_instead_of_withholdin
+ 
+     assert passed and reason == "quality_first_passed"
+     assert "deals.example" not in text and "deal" in text
++
++
++def test_editorial_pages_and_review_publishers_are_never_official():
++    from agent.product_route import _product_url_never_official
++
++    assert _product_url_never_official("https://blenderwise.com/best-blender-under-200")
++    assert _product_url_never_official("https://www.soundguys.com/product/jbl-flip-7")
++    assert _product_url_never_official("https://www.everythingkitchens.com/vitamix-e310.html")
++    assert _product_url_never_official("https://fixoryhq.com/en/tp-link-archer-be9700-review/")
++    assert not _product_url_never_official("https://www.tp-link.com/us/home-networking/wifi-router/archer-be9700")
++    assert not _product_url_never_official("https://www.sharkninja.com/ninja-mega-kitchen-system/BL770.html")
++
++
++def _mix_messages(searches, extracts):
++    messages = [{"role": "user", "content": "Research the best Wi-Fi 7 router under $400 for an apartment."}]
++    for i, (q, urls) in enumerate(searches, 1):
++        messages += _search_messages(q, urls, f"s{i}")
++    for i, pages in enumerate(extracts, 1):
++        messages += _extract_messages(list(pages), f"e{i}", pages)
++    return messages
++
++
++def test_model_path_makes_manufacturer_page_official_and_earlier_candidate_can_carry_the_receipt():
++    from agent.product_route import _product_current_turn_messages, _product_receipt_viability, _product_source_mix_state
++
++    tp = "https://www.tp-link.com/us/home-networking/wifi-router/archer-be9700/"
++    reviews = ["https://www.pcgamer.com/archer-be9700-review", "https://www.tomshardware.com/archer-be9700-tested"]
++    ng = "https://www.netgear.com/home/wifi/routers/rs700s/"
++    messages = _mix_messages(
++        [("archer be9700 independent review official product page current price", [tp] + reviews),
++         ("Netgear Nighthawk RS700S official product site", [ng])],
++        [{tp: "TP-Link Archer BE9700 Wi-Fi 7 router. Price $299.99.",
++          reviews[0]: "The Archer BE9700 is fast; we tested it for a week.",
++          reviews[1]: "TP-Link Archer BE9700 review: strong range."},
++         {ng: "NETGEAR Nighthawk RS700S tri-band Wi-Fi 7 router."}],
++    )
++    mix = _product_source_mix_state(_product_current_turn_messages(messages))
++
++    be9700 = next(p for p in mix["candidate_packets"] if "be9700" in p["candidate_query"])
++    assert any("tp-link.com" in u for u in be9700["product_focused_sources"])
++    ok, reasons = _product_receipt_viability(mix, messages[0]["content"])
++    assert ok, reasons

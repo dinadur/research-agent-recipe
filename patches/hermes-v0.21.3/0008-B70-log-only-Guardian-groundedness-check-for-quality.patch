@@ -1,0 +1,464 @@
+From bcccfdc43a4b0c17cdbe679a8876d08f21898e22 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 17:31:36 +0000
+Subject: [PATCH 08/18] B70: log-only Guardian groundedness check for
+ quality-first product answers
+
+Quality-first answers cite plain Markdown links, so the exact-quote groundedness
+gate never runs for them. With HERMES_PRODUCT_GROUNDEDNESS_SHADOW=1, each linked
+sentence is judged on a daemon thread against the best-matching 800-char windows
+of the frozen extracted pages, and verdicts (p_yes, kind, excerpts, latency) are
+appended to $HERMES_HOME/logs/groundedness-shadow.jsonl. The delivered answer,
+its timing and the agent state are never changed; any failure is logged and
+swallowed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_groundedness.py            | 272 +++++++++++++++++++++++
+ agent/product_route.py                   |   6 +
+ tests/agent/test_product_groundedness.py | 126 +++++++++++
+ 3 files changed, 404 insertions(+)
+
+diff --git a/agent/product_groundedness.py b/agent/product_groundedness.py
+index 8447431e1..e37ddb1f6 100644
+--- a/agent/product_groundedness.py
++++ b/agent/product_groundedness.py
+@@ -8,8 +8,12 @@ supported by the exact excerpts already accepted by the deterministic gate.
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
++import os
+ import re
++import threading
++import time
+ from collections.abc import Mapping, Sequence
+ from typing import Any
+ 
+@@ -293,6 +297,274 @@ def evaluate_product_claims(
+     return True, "passed", ()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Log-only (shadow) groundedness check for quality-first answers.
++#
++# Quality-first answers cite plain Markdown links instead of exact-quote
++# evidence rows, so the gate above never runs for them.  The shadow check
++# judges each linked sentence against the best-matching window of the frozen
++# extracted page text and appends the verdicts to a JSONL log.  It runs on a
++# daemon thread, never touches the agent, and can never change, delay or
++# withhold the delivered answer.
++# ---------------------------------------------------------------------------
++
++GROUNDEDNESS_SHADOW_ENV = "HERMES_PRODUCT_GROUNDEDNESS_SHADOW"
++_SHADOW_MAX_CLAIMS = 40
++_SHADOW_MAX_EXCERPTS = 3
++_SHADOW_WINDOW_CHARS = 800
++_SHADOW_TIMEOUT_SECONDS = 15.0
++_SHADOW_LOCK = threading.Lock()
++_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\((https://[^)\s]+)\)")
++_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(*A-Z0-9$])")
++_TABLE_SEPARATOR_LINE_RE = re.compile(r"^\|?\s*:?-{3,}")
++_STOPWORDS = frozenset(
++    "the a an and or of to in on for with is are be by as at it its this that "
++    "from if you your not but so than then into up also has have can may more "
++    "most only per each one any all".split()
++)
++
++
++def groundedness_shadow_enabled() -> bool:
++    return os.environ.get(GROUNDEDNESS_SHADOW_ENV, "").strip() == "1"
++
++
++def _shadow_canonical(url: str) -> str:
++    from urllib.parse import urlsplit, urlunsplit
++
++    parts = urlsplit(url.strip().rstrip("`.,;:!?"))
++    return urlunsplit(
++        (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/") or "/",
++         parts.query, "")
++    )
++
++
++def shadow_linked_claims(text: str) -> tuple[dict[str, Any], ...]:
++    """Sentences that cite at least one https link, with the cited URLs."""
++
++    claims: list[dict[str, Any]] = []
++    for line_no, raw in enumerate(str(text or "").splitlines(), 1):
++        line = raw.strip()
++        if (
++            not line
++            or line.startswith("#")
++            or line.startswith("Publication status:")
++            or _TABLE_SEPARATOR_LINE_RE.match(line)
++        ):
++            continue
++        line = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", line)
++        for sentence in _SENTENCE_SPLIT_RE.split(line):
++            urls = []
++            for match in _MARKDOWN_LINK_RE.finditer(sentence):
++                canonical = _shadow_canonical(match.group(2))
++                if canonical not in urls:
++                    urls.append(canonical)
++            if not urls:
++                continue
++            claim = _MARKDOWN_LINK_RE.sub("", sentence)
++            claim = re.sub(r"\s+([,.;:])", r"\1", claim)
++            claim = re.sub(r"[\s,.]+$", "", claim.replace("**", "")).strip()
++            claim = re.sub(r"\s{2,}", " ", claim)
++            if len(claim) < 12:
++                continue
++            claims.append({"line": line_no, "claim": claim, "urls": tuple(urls)})
++    return tuple(claims)
++
++
++def _shadow_terms(value: str) -> dict[str, float]:
++    weights: dict[str, float] = {}
++    for token in re.findall(r"\$?\d[\d,.]*|[a-z][a-z0-9-]+", value.casefold()):
++        token = token.rstrip(".,")
++        if not token or token in _STOPWORDS or len(token) < 2:
++            continue
++        weights[token] = 3.0 if any(ch.isdigit() for ch in token) else 1.0
++    return weights
++
++
++_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
++_ABSENCE_RE = re.compile(
++    r"\b(?:unverified|does not (?:state|include|confirm|verify|list|say|explicitly)|"
++    r"do not (?:state|include|confirm|verify)|not (?:verified|stated|confirmed)|"
++    r"in the packet|evidence gap)\b",
++    re.IGNORECASE,
++)
++_ADVICE_RE = re.compile(
++    r"^(?:buy|choose|accept|consider|pick|get|skip|avoid|if|still|so|for)\b|"
++    r"\b(?:you should|recommend|best (?:verified|overall|choice)|worth)\b",
++    re.IGNORECASE,
++)
++
++
++def shadow_claim_kind(claim: str) -> str:
++    """Rough label for offline analysis; every kind is still judged."""
++
++    if _ABSENCE_RE.search(claim):
++        return "absence"
++    if _ADVICE_RE.search(claim):
++        return "advice"
++    return "fact"
++
++
++def _shadow_clean_page(page: str) -> str:
++    page = _MARKDOWN_IMAGE_RE.sub(" ", str(page or ""))
++    page = _MARKDOWN_LINK_RE.sub(r"\1", page)
++    page = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", page)
++    return re.sub(r"\s+", " ", page).strip()
++
++
++def shadow_best_passages(claim: str, page: str, count: int = 1) -> list[tuple[str, float]]:
++    """Up to ``count`` non-overlapping <=800-char windows with the most claim-term overlap."""
++
++    page = _shadow_clean_page(page)
++    if len(page) <= _SHADOW_WINDOW_CHARS:
++        return [(page, 0.0)]
++    terms = _shadow_terms(claim)
++    total = sum(terms.values()) or 1.0
++    step = _SHADOW_WINDOW_CHARS // 4
++    scored = []
++    for start in range(0, len(page) - step, step):
++        window = page[start:start + _SHADOW_WINDOW_CHARS]
++        lowered = window.casefold()
++        scored.append((sum(w for term, w in terms.items() if term in lowered), start))
++    scored.sort(key=lambda item: (-item[0], item[1]))
++    chosen: list[tuple[float, int]] = []
++    for score, start in scored:
++        if all(abs(start - other) >= _SHADOW_WINDOW_CHARS for _, other in chosen):
++            chosen.append((score, start))
++        if len(chosen) == count:
++            break
++    return [
++        (page[start:start + _SHADOW_WINDOW_CHARS], round(score / total, 3))
++        for score, start in sorted(chosen, key=lambda item: item[1])
++    ]
++
++
++def shadow_best_passage(claim: str, page: str) -> tuple[str, float]:
++    return shadow_best_passages(claim, page, 1)[0]
++
++
++def _shadow_log_path():
++    from pathlib import Path
++
++    override = os.environ.get("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", "").strip()
++    if override:
++        return Path(override)
++    from hermes_constants import get_hermes_home
++
++    return get_hermes_home() / "logs" / "groundedness-shadow.jsonl"
++
++
++def run_groundedness_shadow(
++    text: str,
++    source_texts: Mapping[str, str],
++    config: Mapping[str, Any],
++    session_id: str,
++) -> dict[str, Any]:
++    """Judge every linked claim and append one JSONL row per claim."""
++
++    log_path = _shadow_log_path()
++    log_path.parent.mkdir(parents=True, exist_ok=True)
++    pages = {_shadow_canonical(url): body for url, body in dict(source_texts).items()}
++    claims = shadow_linked_claims(text)
++    url = _chat_completions_url(str(config.get("base_url") or ""))
++    headers = {
++        "Authorization": f"Bearer {config.get('api_key') or 'local-judge'}",
++        "Content-Type": "application/json",
++    }
++    summary = {"claims": len(claims), "judged": 0, "verbatim": 0, "no_source_text": 0,
++               "yes": 0, "no": 0, "errors": 0, "capped": max(0, len(claims) - _SHADOW_MAX_CLAIMS)}
++    rows = []
++    for index, row in enumerate(claims[:_SHADOW_MAX_CLAIMS]):
++        claim = row["claim"]
++        cited = [u for u in row["urls"] if u in pages]
++        record: dict[str, Any] = {
++            "t": round(time.time(), 3), "session_id": session_id, "claim_index": index,
++            "line": row["line"], "kind": shadow_claim_kind(claim), "claim": claim[:1200],
++            "urls": list(row["urls"]),
++        }
++        if not cited:
++            summary["no_source_text"] += 1
++            record["status"] = "no_source_text"
++            rows.append(record)
++            continue
++        evidence = []
++        per_url = 2 if len(cited) == 1 else 1
++        for cited_url in cited[:_SHADOW_MAX_EXCERPTS]:
++            for passage, overlap in shadow_best_passages(claim, pages[cited_url], per_url):
++                evidence.append({"url": cited_url, "quote": passage, "overlap": overlap})
++        record["excerpts"] = evidence
++        record["excerpts_capped"] = max(0, len(cited) - _SHADOW_MAX_EXCERPTS)
++        if _claim_is_verbatim_supported(claim, evidence):
++            summary["verbatim"] += 1
++            record["status"] = "verbatim"
++            rows.append(record)
++            continue
++        payload = {
++            "model": str(config.get("model") or ""),
++            "messages": _guardian_messages(claim, evidence),
++            "temperature": 0,
++            "max_tokens": 32,
++            "stream": False,
++        }
++        started = time.monotonic()
++        try:
++            body = _post_guardian(url, payload, headers, _SHADOW_TIMEOUT_SECONDS)
++            verdict = "yes" if _parse_guardian_score(_response_content(body)) else "no"
++            clef = body.get("clef") if isinstance(body.get("clef"), Mapping) else {}
++            record.update(status="judged", verdict=verdict, p_yes=clef.get("p_yes"),
++                          threshold=clef.get("threshold"))
++            summary["judged"] += 1
++            summary[verdict] += 1
++        except Exception as exc:
++            record.update(status="error", error=str(exc)[:300])
++            summary["errors"] += 1
++        record["latency_s"] = round(time.monotonic() - started, 3)
++        rows.append(record)
++    rows.append({"t": round(time.time(), 3), "session_id": session_id,
++                 "status": "summary", **summary})
++    with open(log_path, "a", encoding="utf-8") as handle:
++        for record in rows:
++            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
++    return summary
++
++
++def start_groundedness_shadow(agent: Any, text: str, source_texts: Any) -> None:
++    """Fire-and-forget shadow check; any failure is logged and swallowed."""
++
++    try:
++        if not groundedness_shadow_enabled():
++            return
++        config = _judge_config(agent)
++        if config.get("enabled") is not True or not config.get("base_url"):
++            return
++        snapshot_text = str(text or "")
++        snapshot_sources = {
++            str(k): str(v) for k, v in dict(source_texts or {}).items()
++            if isinstance(v, str)
++        }
++        session_id = str(getattr(agent, "session_id", None) or "none")
++
++        def worker() -> None:
++            try:
++                with _SHADOW_LOCK:
++                    summary = run_groundedness_shadow(
++                        snapshot_text, snapshot_sources, config, session_id
++                    )
++                logger.info(
++                    "Product groundedness shadow check: session=%s %s",
++                    session_id,
++                    " ".join(f"{k}={v}" for k, v in summary.items()),
++                )
++            except Exception:
++                logger.exception("Product groundedness shadow check failed")
++
++        threading.Thread(
++            target=worker, name="groundedness-shadow", daemon=True
++        ).start()
++    except Exception:
++        logger.exception("Could not start product groundedness shadow check")
++
++
+ __all__ = [
+     "evaluate_product_claims",
++    "start_groundedness_shadow",
+ ]
+diff --git a/agent/product_route.py b/agent/product_route.py
+index 40cbb656f..f5e344c00 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -5634,6 +5634,12 @@ def validate_product_research_response(
+         text = str(response or "").strip()
+         if PRODUCT_RESEARCH_PUBLICATION_FOOTER not in text:
+             text = f"{text}\n\n{PRODUCT_RESEARCH_PUBLICATION_FOOTER}"
++        try:
++            from agent.product_groundedness import start_groundedness_shadow
++
++            start_groundedness_shadow(agent, text, source_texts)
++        except Exception:
++            logger.exception("Product groundedness shadow check not started")
+         return True, text, "quality_first_passed"
+     durable_mode = _product_research_durable_comparison_mode(original_request)
+     catalog = _bound_product_research_evidence_catalog(agent)
+diff --git a/tests/agent/test_product_groundedness.py b/tests/agent/test_product_groundedness.py
+index d05daa520..16d9aa49f 100644
+--- a/tests/agent/test_product_groundedness.py
++++ b/tests/agent/test_product_groundedness.py
+@@ -185,3 +185,129 @@ def test_verbatim_entity_label_uses_deterministic_short_circuit(monkeypatch):
+         (),
+     )
+     assert agent._product_research_groundedness_judge_status["model_judged"] == 0
++
++
++# --- log-only shadow check for quality-first answers -------------------------
++
++_SHADOW_ANSWER = """## Conclusion
++
++**Buy the Acme X1** for long flights [Acme page](https://acme.example/x1/).
++
++## Model fit
++
++The Acme page lists **$299.99** and up to 30-hour battery life [Acme page](https://acme.example/x1). It is great value. The guide says it does not fold [Guide](https://guide.example/best), [Acme page](https://acme.example/x1).
++- Plain uncited bullet with no link at all.
++
++Publication status: Draft only—nothing was written to the wiki. Publication requires a separate controlled step.
++"""
++
++
++def test_shadow_extracts_only_linked_sentences_with_canonical_urls():
++    claims = product_groundedness.shadow_linked_claims(_SHADOW_ANSWER)
++
++    assert [c["claim"] for c in claims] == [
++        "Buy the Acme X1 for long flights",
++        "The Acme page lists $299.99 and up to 30-hour battery life",
++        "The guide says it does not fold",
++    ]
++    assert claims[0]["urls"] == ("https://acme.example/x1",)
++    assert claims[2]["urls"] == ("https://guide.example/best", "https://acme.example/x1")
++
++
++def test_shadow_passage_prefers_window_with_numbers():
++    page = ("filler words about shipping and returns. " * 60
++            + "Battery: up to 30-hour battery life. Price $299.99. "
++            + "more filler about warranty terms. " * 60)
++    passage, overlap = product_groundedness.shadow_best_passage(
++        "lists $299.99 and up to 30-hour battery life", page)
++
++    assert "$299.99" in passage and "30-hour" in passage
++    assert len(passage) <= 800 and overlap > 0.5
++
++
++def test_shadow_run_logs_verdicts_and_never_needs_agent(monkeypatch, tmp_path):
++    log = tmp_path / "shadow.jsonl"
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", str(log))
++    seen = []
++
++    def post(url, payload, headers, timeout):
++        seen.append(payload)
++        body = _body("no" if "great value" in payload["messages"][1]["content"] else "yes")
++        body["clef"] = {"p_yes": 0.9, "threshold": 0.85}
++        return body
++
++    monkeypatch.setattr(product_groundedness, "_post_guardian", post)
++    summary = product_groundedness.run_groundedness_shadow(
++        _SHADOW_ANSWER,
++        {"https://acme.example/x1/": "Acme X1. $299.99. Up to 30-hour battery life.",
++         "https://guide.example/best": "The Acme X1 does not fold flat."},
++        _agent()._product_research_groundedness_config,
++        "sess-1",
++    )
++
++    rows = [__import__("json").loads(l) for l in log.read_text().splitlines()]
++    assert summary["claims"] == 3 and summary["errors"] == 0
++    assert rows[-1]["status"] == "summary" and rows[-1]["session_id"] == "sess-1"
++    judged = [r for r in rows if r.get("status") == "judged"]
++    assert judged and all(r["p_yes"] == 0.9 for r in judged)
++    assert all(len(p["messages"]) == 3 for p in seen)
++
++
++def test_shadow_start_is_noop_without_env_and_swallows_errors(monkeypatch):
++    monkeypatch.delenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW", raising=False)
++    started = []
++    monkeypatch.setattr(product_groundedness.threading, "Thread",
++                        lambda **kw: started.append(kw))
++    product_groundedness.start_groundedness_shadow(_agent(), _SHADOW_ANSWER, {})
++    assert started == []
++
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW", "1")
++    monkeypatch.setattr(product_groundedness, "_judge_config",
++                        lambda agent: (_ for _ in ()).throw(RuntimeError("boom")))
++    product_groundedness.start_groundedness_shadow(_agent(), _SHADOW_ANSWER, {})
++    assert started == []
++
++
++def test_shadow_start_does_not_touch_agent_state(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW", "1")
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", str(tmp_path / "s.jsonl"))
++    monkeypatch.setattr(product_groundedness, "_post_guardian",
++                        lambda *a: _body("yes"))
++    agent = _agent()
++    before = dict(vars(agent))
++    product_groundedness.start_groundedness_shadow(agent, _SHADOW_ANSWER, {
++        "https://acme.example/x1": "Acme X1 page text."})
++    for thread in product_groundedness.threading.enumerate():
++        if thread.name == "groundedness-shadow":
++            thread.join(5)
++    assert vars(agent) == before
++    assert (tmp_path / "s.jsonl").exists()
++
++
++def test_quality_first_pass_starts_shadow_and_ignores_its_failure(monkeypatch):
++    from agent import product_route, quality_first_route
++
++    monkeypatch.setattr(product_route, "product_research_route_active", lambda a: True)
++    monkeypatch.setattr(product_route, "product_research_quality_first_active", lambda a: True)
++    monkeypatch.setattr(quality_first_route, "response_diagnostics",
++                        lambda *a: {"passed": True})
++    agent = SimpleNamespace(
++        _current_turn_id="t1", _product_research_receipt_turn_id="t1",
++        _product_research_receipt_sources=("https://acme.example/x1",),
++        _product_research_receipt_source_texts={"https://acme.example/x1": "page"},
++        _product_research_operator_prompt="Research the best headphones",
++    )
++    calls = []
++    monkeypatch.setattr(product_groundedness, "start_groundedness_shadow",
++                        lambda a, text, sources: calls.append((text, sources)))
++
++    passed, text, reason = product_route.validate_product_research_response(agent, "Answer [A](https://acme.example/x1).")
++
++    assert (passed, reason) == (True, "quality_first_passed")
++    assert calls == [(text, {"https://acme.example/x1": "page"})]
++
++    def boom(*a):
++        raise RuntimeError("shadow broke")
++
++    monkeypatch.setattr(product_groundedness, "start_groundedness_shadow", boom)
++    assert product_route.validate_product_research_response(agent, "Answer [A](https://acme.example/x1).") == (passed, text, reason)

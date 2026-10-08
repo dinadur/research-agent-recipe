@@ -1,0 +1,171 @@
+From c154808aa807ddf856b94dcef32b88a6b6da80a1 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 11:20:38 +0000
+Subject: [PATCH 07/18] B70: retry reasoning-only clean stops before promoting
+ reasoning
+
+A llama.cpp reasoning budget can end thinking mid-thought and stop with an
+empty answer. The reasoning-only clean-stop promotion then delivered the raw
+chain-of-thought as the reply (Stage 1 preflight 9, budget-01: 5092 chars).
+Run the existing thinking-only prefill retries first and promote the
+reasoning only once they are exhausted, so the misfiled-answer workaround
+(PR #48795) still applies after two retries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/turn_final_response.py                  |  8 ++--
+ .../test_empty_terminal_reasoning_surface.py  | 47 ++++++++++++++++---
+ tests/agent/test_run_agent.py                 | 12 ++---
+ .../test_thinking_prefill_trailing_turn.py    |  3 +-
+ 4 files changed, 52 insertions(+), 18 deletions(-)
+
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 71dcd185d..627df051e 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -75,15 +75,17 @@ def finish_text_response(
+     # Reasoning-only clean stop: some reasoning parsers (vLLM nemotron_v3 past ~500K
+     # prompt tokens) file the whole answer as reasoning when the model omits the closing
+     # delimiter. ``finish_reason == "stop"`` means the provider considers generation
+-    # complete, so the empty-response ladder would only re-bill the same input to arrive
+-    # at a truncated preview of this text; promote the reasoning to the visible answer
+-    # BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path,
++    # complete. B70: a reasoning budget (llama.cpp) can also end thinking mid-thought and
++    # stop with an empty answer; promoting then publishes raw chain-of-thought. So the
++    # thinking-only prefill retries run first, and the reasoning is promoted only once
++    # they are exhausted. ``length`` (cut off mid-thought) stays on the continuation path,
+     # and the promoted text is persisted as ordinary content so the next turn replays it.
+     _content = assistant_message.content
+     if (
+         finish_reason == "stop"
+         and not assistant_message.tool_calls
+         and (_content is None or (isinstance(_content, str) and not _content.strip()))
++        and agent._thinking_prefill_retries >= 2
+     ):
+         _promoted = agent._extract_reasoning(assistant_message)
+         if _promoted:
+diff --git a/tests/agent/test_empty_terminal_reasoning_surface.py b/tests/agent/test_empty_terminal_reasoning_surface.py
+index 21c13ad30..1804146b4 100644
+--- a/tests/agent/test_empty_terminal_reasoning_surface.py
++++ b/tests/agent/test_empty_terminal_reasoning_surface.py
+@@ -1,12 +1,16 @@
+ """Tests for reasoning-only final responses.
+ 
+ A clean-stop response (``finish_reason == "stop"``) with no ordinary content but
+-structured reasoning IS the answer: the reasoning is promoted to the visible reply and
+-persisted as assistant content without entering the empty-response recovery ladder
+-(every rung re-bills the full prompt). Idea credit: PR #48795 (@ligl0325).
++structured reasoning may be a misfiled answer, so after the thinking-only prefill
++retries the reasoning is promoted to the visible reply and persisted as assistant
++content. Idea credit: PR #48795 (@ligl0325). B70: the prefill retries run first,
++because a reasoning budget can end thinking mid-thought with an empty answer and
++promoting that would publish raw chain-of-thought.
+ 
+ Invariants pinned here:
+-- Clean-stop reasoning-only → returned and persisted after ONE API call.
++- Clean-stop reasoning-only → a visible answer from a prefill retry wins.
++- Clean-stop reasoning-only every time → promoted and persisted after the two
++  prefill retries (THREE API calls).
+ - ``finish_reason == "length"`` reasoning is unfinished: never promoted, the
+   continuation path still owns it.
+ - A truly empty response (no reasoning either) still reaches the ladder terminal.
+@@ -79,8 +83,37 @@ def _truly_empty_response():
+     )
+ 
+ 
+-def test_clean_stop_reasoning_only_returns_on_first_call(tmp_path, monkeypatch):
+-    """A clean stop promotes structured reasoning without a recovery call."""
++def test_clean_stop_reasoning_only_prefill_answer_wins(tmp_path, monkeypatch):
++    """A visible answer from the thinking-only prefill retry is delivered, not the reasoning."""
++    agent = _build_agent(tmp_path, monkeypatch)
++    responses = [
++        _reasoning_only_response(),
++        SimpleNamespace(
++            choices=[SimpleNamespace(
++                message=SimpleNamespace(
++                    content="42.",
++                    reasoning=None,
++                    reasoning_content=None,
++                    reasoning_details=None,
++                    tool_calls=None,
++                ),
++                finish_reason="stop",
++            )],
++            usage=None,
++            model="test-model",
++        ),
++    ]
++    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
++
++    result = agent.run_conversation("what is the answer?")
++
++    assert result["final_response"] == "42."
++    assert result["api_calls"] == 2
++    assert "calculation above" not in result["final_response"]
++
++
++def test_clean_stop_reasoning_only_promoted_after_prefill_retries(tmp_path, monkeypatch):
++    """Reasoning-only on every attempt: promoted after the two prefill retries."""
+     agent = _build_agent(tmp_path, monkeypatch)
+     monkeypatch.setattr(
+         agent, "_interruptible_api_call",
+@@ -90,7 +123,7 @@ def test_clean_stop_reasoning_only_returns_on_first_call(tmp_path, monkeypatch):
+     result = agent.run_conversation("what is the answer?")
+ 
+     assert result["final_response"] == "The answer is 42 because of the calculation above."
+-    assert result["api_calls"] == 1
++    assert result["api_calls"] == 3
+     # The promoted text is durable content, so the next turn replays a real answer.
+     assert result["messages"][-1]["role"] == "assistant"
+     assert result["messages"][-1]["content"] == "The answer is 42 because of the calculation above."
+diff --git a/tests/agent/test_run_agent.py b/tests/agent/test_run_agent.py
+index df512c9c2..b22f397ac 100644
+--- a/tests/agent/test_run_agent.py
++++ b/tests/agent/test_run_agent.py
+@@ -3549,8 +3549,8 @@ class TestRunConversation:
+         assert result["completed"] is True
+         assert result["api_calls"] == 2
+ 
+-    def test_reasoning_only_local_clean_stop_returns_immediately(self, agent):
+-        """A clean-stop reasoning answer returns without compression or recovery."""
++    def test_reasoning_only_local_clean_stop_promoted_after_prefill(self, agent):
++        """A clean-stop reasoning answer is promoted after the prefill retries, without compression."""
+         self._setup_agent(agent)
+         agent.base_url = "http://127.0.0.1:1234/v1"
+         agent.compression_enabled = True
+@@ -3577,10 +3577,10 @@ class TestRunConversation:
+         assert result["completed"] is True
+         assert result["final_response"] == "reasoning only"
+         assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+-        assert result["api_calls"] == 1
++        assert result["api_calls"] == 3  # B70: original + two thinking-only prefill retries
+ 
+-    def test_reasoning_only_response_returns_on_first_call(self, agent):
+-        """Structured reasoning-only clean stops bypass the empty-response ladder."""
++    def test_reasoning_only_response_promoted_after_prefill(self, agent):
++        """Structured reasoning-only clean stops are promoted once the prefill retries are spent."""
+         self._setup_agent(agent)
+         empty_resp = _mock_response(
+             content=None,
+@@ -3596,7 +3596,7 @@ class TestRunConversation:
+             result = agent.run_conversation("answer me")
+         assert result["completed"] is True
+         assert result["final_response"] == "structured reasoning answer"
+-        assert result["api_calls"] == 1
++        assert result["api_calls"] == 3  # B70: original + two thinking-only prefill retries
+ 
+ 
+     def test_truly_empty_response_stops_after_repeated_empty(self, agent):
+diff --git a/tests/agent/test_thinking_prefill_trailing_turn.py b/tests/agent/test_thinking_prefill_trailing_turn.py
+index 4e41b0555..a452762ec 100644
+--- a/tests/agent/test_thinking_prefill_trailing_turn.py
++++ b/tests/agent/test_thinking_prefill_trailing_turn.py
+@@ -1,7 +1,6 @@
+ """Regression test for the thinking-only prefill reaching the wire.
+ 
+-A thinking-only response (reasoning tokens, no visible text) that is NOT a clean
+-``stop`` (a clean-stop reasoning-only reply is promoted to the answer up front) makes the loop
++A thinking-only response (reasoning tokens, no visible text) makes the loop
+ append an empty assistant turn and re-send so the model continues its own
+ reasoning. On providers that don't echo reasoning back, the API copy has its
+ reasoning fields stripped before ``_drop_thinking_only_and_merge_users`` runs,

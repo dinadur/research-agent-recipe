@@ -1,0 +1,64 @@
+From f25e786baff5d5b33e12e0f7edbf1a08adff85a4 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 14:19:44 +0000
+Subject: [PATCH 06/18] B70: narrow open-ended research wording
+
+Open-ended detection now keys on buying and choice wording: "best" (but
+not "best practices"), options, alternatives, recommend, choices, "top
+N", "which ... should I buy/get/choose", budgets and prices ("around
+$1000", "under $500"). A bare "around", "which", "compare" or "versus"
+no longer counts, so targeted research ("current best practices for
+...", "travel around Lisbon", "how heat pumps compare to furnaces")
+keeps the default 3-search, 2-extract budget. Explicit comparisons keep
+their own per-alternative allocation. One new test.
+
+Research regression suites pass. User-authorized on 2026-09-28.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/generic_research_route.py                 |  6 ++++--
+ tests/agent/test_generic_research_open_ended.py | 17 +++++++++++++++++
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/agent/generic_research_route.py b/agent/generic_research_route.py
+index e6b1a805a..a1137d7a2 100644
+--- a/agent/generic_research_route.py
++++ b/agent/generic_research_route.py
+@@ -61,8 +61,10 @@ GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS = 5
+ GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS = 3
+ GENERIC_RESEARCH_BROAD_SOURCE_TARGET = 4
+ _OPEN_ENDED_RE = re.compile(
+-    r"\b(?:best|options?|alternatives?|recommend\w*|which|top|choices?|candidates?|worth|"
+-    r"around|under|budget|compare|comparison|versus|vs)\b|\$\s?\d",
++    r"\bbest\b(?!\s+practices?)|\b(?:options?|alternatives?|recommend\w*|choices?|candidates?)\b|"
++    r"\bworth\s+(?:it|buying|getting)\b|\btop\s+\d+\b|\bbudget\b|"
++    r"\b(?:which|what)\s+(?:\w+\s+){0,2}(?:should|to)\s+(?:i\s+)?(?:buy|get|choose|pick)\b|"
++    r"\b(?:under|around|below|about|up\s+to)\s+\$\s?\d|\$\s?\d",
+     re.IGNORECASE,
+ )
+ GENERIC_RESEARCH_BROAD_NOTE = (
+diff --git a/tests/agent/test_generic_research_open_ended.py b/tests/agent/test_generic_research_open_ended.py
+index 7c0b24203..fc47f60ea 100644
+--- a/tests/agent/test_generic_research_open_ended.py
++++ b/tests/agent/test_generic_research_open_ended.py
+@@ -112,3 +112,20 @@ def test_open_ended_receipt_seals_immediately_with_enough_sources():
+     urls = [f"https://site{index}.example/printer" for index in range(4)]
+     arguments, details = prepare_generic_research_controller_receipt(agent, [call], _extract(urls))
+     assert arguments is not None and details["successful_sources"] == 4
++
++
++def test_open_ended_wording_is_specific():
++    open_ended = [
++        "Research the best espresso machines under $500 and save it as a wiki article.",
++        "Research which laptop I should buy for video editing and save it to the wiki.",
++        "Research the top 5 hiking boots for wide feet and save it to the wiki.",
++        "Research alternatives to Notion for a small team and save it as a wiki page.",
++    ]
++    targeted = [
++        "Research current best practices for sourdough starters and save it to the wiki.",
++        "Research travel around Lisbon in spring and save it as a wiki article.",
++        "Research the history of the Eiffel Tower and save it to the wiki.",
++        "Research how heat pumps compare to gas furnaces and save it to the wiki.",
++    ]
++    assert all(generic_research_broad_request(p) for p in open_ended)
++    assert not any(generic_research_broad_request(p) for p in targeted)

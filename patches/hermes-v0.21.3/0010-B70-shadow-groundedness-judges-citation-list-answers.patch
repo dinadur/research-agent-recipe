@@ -1,0 +1,296 @@
+From 093a1e398e5fd0b28d107227f3634cd2495b76d7 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:04:40 +0000
+Subject: [PATCH 10/18] B70: shadow groundedness judges citation-list answers;
+ cleaner claims
+
+- Answers that cite only in a trailing 'Citations:'/'Sources:' line or section
+  had no inline-linked sentences and produced zero shadow claims. Substantive
+  uncited sentences (>= 40 chars, not table rows) are now judged against the
+  best-matching windows across every listed page (mode=list in the log).
+- Sentence splitting handles a bold close after the full stop ('...ally.** It').
+- Empty '()' left where a link sat in parentheses is removed from claim text.
+- All excerpts for one claim share a 1400-char budget: Clef's server batch is
+  1024 tokens and three 800-char windows of dense spec text overflowed it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_groundedness.py            | 112 ++++++++++++++++++-----
+ tests/agent/test_product_groundedness.py |  78 ++++++++++++++++
+ 2 files changed, 165 insertions(+), 25 deletions(-)
+
+diff --git a/agent/product_groundedness.py b/agent/product_groundedness.py
+index e37ddb1f6..87aa48cd5 100644
+--- a/agent/product_groundedness.py
++++ b/agent/product_groundedness.py
+@@ -312,10 +312,13 @@ GROUNDEDNESS_SHADOW_ENV = "HERMES_PRODUCT_GROUNDEDNESS_SHADOW"
+ _SHADOW_MAX_CLAIMS = 40
+ _SHADOW_MAX_EXCERPTS = 3
+ _SHADOW_WINDOW_CHARS = 800
++# Clef's server batch is 1024 tokens; dense spec text runs near 3 chars/token, so
++# all excerpts of one claim share this budget (the criterion adds ~250 tokens).
++_SHADOW_EXCERPT_BUDGET_CHARS = 1400
+ _SHADOW_TIMEOUT_SECONDS = 15.0
+ _SHADOW_LOCK = threading.Lock()
+ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\((https://[^)\s]+)\)")
+-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(*A-Z0-9$])")
++_SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[.!?])|(?<=[.!?]\*\*))\s+(?=[\"'(*A-Z0-9$])")
+ _TABLE_SEPARATOR_LINE_RE = re.compile(r"^\|?\s*:?-{3,}")
+ _STOPWORDS = frozenset(
+     "the a an and or of to in on for with is are be by as at it its this that "
+@@ -338,35 +341,78 @@ def _shadow_canonical(url: str) -> str:
+     )
+ 
+ 
++_CITATION_LIST_RE = re.compile(
++    r"^(?:\*\*)?(?:citations|sources|references|cited pages)(?:\*\*)?\s*:?(?:\*\*)?\s*",
++    re.IGNORECASE,
++)
++_EMPTY_PARENS_RE = re.compile(r"\(\s*[,;]?\s*\)")
++
++
++def _shadow_clean_claim(sentence: str) -> str:
++    claim = _MARKDOWN_LINK_RE.sub("", sentence)
++    claim = _EMPTY_PARENS_RE.sub("", claim)
++    claim = re.sub(r"\s+([,.;:])", r"\1", claim)
++    claim = re.sub(r"[\s,.]+$", "", claim.replace("**", "")).strip()
++    return re.sub(r"\s{2,}", " ", claim)
++
++
+ def shadow_linked_claims(text: str) -> tuple[dict[str, Any], ...]:
+-    """Sentences that cite at least one https link, with the cited URLs."""
++    """Claims to judge, each with the URLs that should support it.
++
++    A sentence with inline links cites those links ("inline").  When the answer
++    also carries a citations list (a "Citations:"/"Sources:" line or section),
++    each substantive sentence without an inline link is judged against every
++    URL in that list ("list").
++    """
++
++    lines = str(text or "").splitlines()
++    list_urls: list[str] = []
++    list_lines: set[int] = set()
++    in_list_section = False
++    for line_no, raw in enumerate(lines, 1):
++        line = raw.strip()
++        heading = re.sub(r"^#+\s*", "", line)
++        if line.startswith("#"):
++            in_list_section = heading.strip("*: ").casefold() in {
++                "citations", "sources", "references", "cited pages"}
++            if in_list_section:
++                list_lines.add(line_no)
++            continue
++        if in_list_section or _CITATION_LIST_RE.match(line):
++            if _MARKDOWN_LINK_RE.search(line) or not line:
++                list_lines.add(line_no)
++                for match in _MARKDOWN_LINK_RE.finditer(line):
++                    canonical = _shadow_canonical(match.group(2))
++                    if canonical not in list_urls:
++                        list_urls.append(canonical)
+ 
+     claims: list[dict[str, Any]] = []
+-    for line_no, raw in enumerate(str(text or "").splitlines(), 1):
++    for line_no, raw in enumerate(lines, 1):
+         line = raw.strip()
+         if (
+             not line
++            or line_no in list_lines
+             or line.startswith("#")
+             or line.startswith("Publication status:")
+             or _TABLE_SEPARATOR_LINE_RE.match(line)
+         ):
+             continue
+-        line = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", line)
++        line = re.sub(r"^(?:[-*\u2022]|\d+[.)])\s+", "", line)
+         for sentence in _SENTENCE_SPLIT_RE.split(line):
+             urls = []
+             for match in _MARKDOWN_LINK_RE.finditer(sentence):
+                 canonical = _shadow_canonical(match.group(2))
+                 if canonical not in urls:
+                     urls.append(canonical)
++            mode = "inline"
+             if not urls:
++                if not list_urls or line.startswith("|"):
++                    continue
++                urls, mode = list(list_urls), "list"
++            claim = _shadow_clean_claim(sentence)
++            if len(claim) < (12 if mode == "inline" else 40):
+                 continue
+-            claim = _MARKDOWN_LINK_RE.sub("", sentence)
+-            claim = re.sub(r"\s+([,.;:])", r"\1", claim)
+-            claim = re.sub(r"[\s,.]+$", "", claim.replace("**", "")).strip()
+-            claim = re.sub(r"\s{2,}", " ", claim)
+-            if len(claim) < 12:
+-                continue
+-            claims.append({"line": line_no, "claim": claim, "urls": tuple(urls)})
++            claims.append({"line": line_no, "claim": claim, "urls": tuple(urls), "mode": mode})
+     return tuple(claims)
+ 
+ 
+@@ -411,29 +457,30 @@ def _shadow_clean_page(page: str) -> str:
+     return re.sub(r"\s+", " ", page).strip()
+ 
+ 
+-def shadow_best_passages(claim: str, page: str, count: int = 1) -> list[tuple[str, float]]:
+-    """Up to ``count`` non-overlapping <=800-char windows with the most claim-term overlap."""
++def shadow_best_passages(
++    claim: str, page: str, count: int = 1, window: int = _SHADOW_WINDOW_CHARS
++) -> list[tuple[str, float]]:
++    """Up to ``count`` non-overlapping ``window``-char windows with the most claim-term overlap."""
+ 
+     page = _shadow_clean_page(page)
+-    if len(page) <= _SHADOW_WINDOW_CHARS:
++    if len(page) <= window:
+         return [(page, 0.0)]
+     terms = _shadow_terms(claim)
+     total = sum(terms.values()) or 1.0
+-    step = _SHADOW_WINDOW_CHARS // 4
++    step = window // 4
+     scored = []
+     for start in range(0, len(page) - step, step):
+-        window = page[start:start + _SHADOW_WINDOW_CHARS]
+-        lowered = window.casefold()
++        lowered = page[start:start + window].casefold()
+         scored.append((sum(w for term, w in terms.items() if term in lowered), start))
+     scored.sort(key=lambda item: (-item[0], item[1]))
+     chosen: list[tuple[float, int]] = []
+     for score, start in scored:
+-        if all(abs(start - other) >= _SHADOW_WINDOW_CHARS for _, other in chosen):
++        if all(abs(start - other) >= window for _, other in chosen):
+             chosen.append((score, start))
+         if len(chosen) == count:
+             break
+     return [
+-        (page[start:start + _SHADOW_WINDOW_CHARS], round(score / total, 3))
++        (page[start:start + window], round(score / total, 3))
+         for score, start in sorted(chosen, key=lambda item: item[1])
+     ]
+ 
+@@ -478,7 +525,8 @@ def run_groundedness_shadow(
+         cited = [u for u in row["urls"] if u in pages]
+         record: dict[str, Any] = {
+             "t": round(time.time(), 3), "session_id": session_id, "claim_index": index,
+-            "line": row["line"], "kind": shadow_claim_kind(claim), "claim": claim[:1200],
++            "line": row["line"], "kind": shadow_claim_kind(claim), "mode": row.get("mode", "inline"),
++            "claim": claim[:1200],
+             "urls": list(row["urls"]),
+         }
+         if not cited:
+@@ -487,12 +535,26 @@ def run_groundedness_shadow(
+             rows.append(record)
+             continue
+         evidence = []
+-        per_url = 2 if len(cited) == 1 else 1
+-        for cited_url in cited[:_SHADOW_MAX_EXCERPTS]:
+-            for passage, overlap in shadow_best_passages(claim, pages[cited_url], per_url):
+-                evidence.append({"url": cited_url, "quote": passage, "overlap": overlap})
++        if row.get("mode") == "list":
++            # Judge against the best-matching windows across every listed page.
++            window = min(_SHADOW_WINDOW_CHARS, _SHADOW_EXCERPT_BUDGET_CHARS // _SHADOW_MAX_EXCERPTS)
++            scored = [
++                {"url": cited_url, "quote": passage, "overlap": overlap}
++                for cited_url in cited
++                for passage, overlap in shadow_best_passages(claim, pages[cited_url], 1, window)
++            ]
++            evidence = sorted(scored, key=lambda e: -e["overlap"])[:_SHADOW_MAX_EXCERPTS]
++        else:
++            per_url = 2 if len(cited) == 1 else 1
++            urls = cited[:_SHADOW_MAX_EXCERPTS]
++            window = min(_SHADOW_WINDOW_CHARS, _SHADOW_EXCERPT_BUDGET_CHARS // (len(urls) * per_url))
++            for cited_url in urls:
++                for passage, overlap in shadow_best_passages(claim, pages[cited_url], per_url, window):
++                    evidence.append({"url": cited_url, "quote": passage, "overlap": overlap})
+         record["excerpts"] = evidence
+-        record["excerpts_capped"] = max(0, len(cited) - _SHADOW_MAX_EXCERPTS)
++        record["excerpts_capped"] = (
++            0 if row.get("mode") == "list" else max(0, len(cited) - _SHADOW_MAX_EXCERPTS)
++        )
+         if _claim_is_verbatim_supported(claim, evidence):
+             summary["verbatim"] += 1
+             record["status"] = "verbatim"
+diff --git a/tests/agent/test_product_groundedness.py b/tests/agent/test_product_groundedness.py
+index 16d9aa49f..885dce412 100644
+--- a/tests/agent/test_product_groundedness.py
++++ b/tests/agent/test_product_groundedness.py
+@@ -311,3 +311,81 @@ def test_quality_first_pass_starts_shadow_and_ignores_its_failure(monkeypatch):
+ 
+     monkeypatch.setattr(product_groundedness, "start_groundedness_shadow", boom)
+     assert product_route.validate_product_research_response(agent, "Answer [A](https://acme.example/x1).") == (passed, text, reason)
++
++
++_LIST_ANSWER = """Conclusion: the Dell S2722QC is the best verified choice for photo editing and office work.
++
++The Dell official page confirms USB-C power delivery up to 65 W and height, pivot, swivel and tilt adjustability.
++The LG page lacks the required colour-gamut and price details.
++
++Citations: [Dell page](https://www.dell.example/s2722qc), [LG page](https://www.lg.example/27up850n), [Tracker](https://tracker.example/dell)
++"""
++
++
++def test_shadow_uses_trailing_citation_list_for_uncited_sentences():
++    claims = product_groundedness.shadow_linked_claims(_LIST_ANSWER)
++
++    assert [c["mode"] for c in claims] == ["list", "list", "list"]
++    assert claims[1]["claim"].startswith("The Dell official page confirms USB-C power delivery")
++    assert claims[1]["urls"] == ("https://www.dell.example/s2722qc", "https://www.lg.example/27up850n",
++                                 "https://tracker.example/dell")
++    assert not any(c["claim"].startswith("Citations") for c in claims)
++
++
++def test_shadow_sources_section_and_inline_links_coexist():
++    answer = ("The X1 costs $299 ([Acme](https://acme.example/x1)).\n"
++              "It also ships with a carrying case and a two-year limited warranty in the box.\n\n"
++              "## Sources\n- [Acme](https://acme.example/x1)\n- [Guide](https://guide.example/best)\n")
++    claims = product_groundedness.shadow_linked_claims(answer)
++
++    assert claims[0] == {"line": 1, "claim": "The X1 costs $299", "urls": ("https://acme.example/x1",), "mode": "inline"}
++    assert claims[1]["mode"] == "list" and claims[1]["urls"] == ("https://acme.example/x1", "https://guide.example/best")
++    assert len(claims) == 2
++
++
++def test_shadow_list_mode_picks_best_windows_across_pages(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", str(tmp_path / "s.jsonl"))
++    seen = []
++    monkeypatch.setattr(product_groundedness, "_post_guardian",
++                        lambda url, payload, headers, timeout: seen.append(payload) or _body("yes"))
++    pages = {
++        "https://www.dell.example/s2722qc": ("menu " * 400) + "USB-C power delivery up to 65 W. Height, pivot, swivel and tilt adjustability.",
++        "https://www.lg.example/27up850n": "LG 27UP850N page text without gamut figures.",
++        "https://tracker.example/dell": "Price history for the Dell monitor.",
++    }
++    product_groundedness.run_groundedness_shadow(_LIST_ANSWER, pages, _agent()._product_research_groundedness_config, "s")
++
++    import json as _json
++    rows = [_json.loads(l) for l in (tmp_path / "s.jsonl").read_text().splitlines()]
++    dell = next(r for r in rows if r.get("claim", "").startswith("The Dell official page"))
++    assert dell["mode"] == "list" and dell["excerpts"][0]["url"] == "https://www.dell.example/s2722qc"
++    assert "65 W" in dell["excerpts"][0]["quote"] and len(dell["excerpts"]) <= 3
++
++
++def test_shadow_claim_drops_empty_parentheses_left_by_links():
++    claims = product_groundedness.shadow_linked_claims(
++        "PCMag lists the eero 6+ as Wi-Fi 6 with 4,500 sq ft coverage ([PCMag](https://pcmag.example/eero)).")
++    assert claims[0]["claim"] == "PCMag lists the eero 6+ as Wi-Fi 6 with 4,500 sq ft coverage"
++
++
++def test_shadow_splits_after_bold_full_stop_and_skips_tables_in_list_mode():
++    answer = ("**Pick the Dell S2722QC, conditionally.** It is the strongest verified match for office work today.\n"
++              "| Model | USB-C |\n|---|---|\n| Dell | 65 W |\n\n"
++              "Sources: [Dell](https://www.dell.example/s2722qc)\n")
++    claims = product_groundedness.shadow_linked_claims(answer)
++
++    assert [c["claim"] for c in claims] == ["It is the strongest verified match for office work today"]
++
++
++def test_shadow_excerpts_fit_clef_batch_budget(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", str(tmp_path / "s.jsonl"))
++    monkeypatch.setattr(product_groundedness, "_post_guardian", lambda *a: _body("yes"))
++    page = "spec " * 2000
++    answer = "The model has USB-C and HDMI ([A](https://a.example/p), [B](https://b.example/p), [C](https://c.example/p))."
++    product_groundedness.run_groundedness_shadow(
++        answer, {"https://a.example/p": page, "https://b.example/p": page, "https://c.example/p": page},
++        _agent()._product_research_groundedness_config, "s")
++
++    import json as _json
++    row = _json.loads((tmp_path / "s.jsonl").read_text().splitlines()[0])
++    assert sum(len(e["quote"]) for e in row["excerpts"]) <= product_groundedness._SHADOW_EXCERPT_BUDGET_CHARS

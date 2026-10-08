@@ -1,0 +1,40 @@
+{
+ "tasks": [
+  {
+   "id": "smoke",
+   "prompt": "Do not use tools. Reply with exactly CANARY-OK and no other text.",
+   "expected_exact": "CANARY-OK",
+   "timeout_seconds": 300,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": false
+  },
+  {
+   "id": "chat-temperature",
+   "prompt": "Convert 72 degrees Fahrenheit to Celsius and explain the formula in one sentence.",
+   "minimum_response_chars": 20,
+   "timeout_seconds": 600,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "general-eu-ai-act-gpai",
+   "prompt": "What obligations did the EU AI Act place on providers of general-purpose AI models starting in August 2025? Summarize the main obligations in a short answer with citations to official EU sources.",
+   "minimum_response_chars": 300,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "general-usb4v2-vs-tb5",
+   "prompt": "How does USB4 Version 2.0 (80 Gbps) differ from Thunderbolt 5? Give a short answer with citations to official USB-IF or Intel sources.",
+   "minimum_response_chars": 300,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  }
+ ]
+}

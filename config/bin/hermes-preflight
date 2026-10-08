@@ -1,0 +1,14 @@
+#!/bin/sh
+# ExecStartPre for hermes-gateway: start only the reviewed code.
+# - the checkout lives on the expected filesystem (pin its UUID if it is on a removable or external disk);
+# - HEAD is exactly the pinned commit;
+# - the worktree is clean (no untracked or modified files).
+# Every code deploy updates PINNED_COMMIT (keep a dated backup of this file so a rollback restores the old pin).
+set -eu
+CHECKOUT=/opt/research-agent/hermes
+PINNED_COMMIT=0000000000000000000000000000000000000000   # replace with the full SHA of your patched HEAD
+# FS_UUID=00000000-0000-0000-0000-000000000000
+# [ "$(findmnt -rn -T "$CHECKOUT" -o UUID)" = "$FS_UUID" ]
+[ -x "$CHECKOUT/.venv/bin/hermes" ]
+[ "$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD)" = "$PINNED_COMMIT" ]
+[ -z "$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" status --porcelain --untracked-files=all)" ]

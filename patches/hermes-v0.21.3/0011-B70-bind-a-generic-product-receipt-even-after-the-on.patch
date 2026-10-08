@@ -1,0 +1,141 @@
+From b9fc787d8969fbf9baf9740c6df3e91c67ec9ca2 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:14:31 +0000
+Subject: [PATCH 11/18] B70: bind a generic product receipt even after the
+ one-shot recovery
+
+apply_product_research_receipt_recovery gated everything on the turn's
+one-shot extraction recovery being unspent, including the pure normalization
+that binds a generic capture_receipt.py command to the current session. On
+2026-10-07 19:11 a turn whose recovery had already rewritten a terminal
+detour then sent the unbound helper, which was rejected, and the turn ended
+with RESEARCH_RECEIPT_ERROR. The binding now stays available after the
+recovery is spent (the extraction rewrite stays one-shot), and accepts any
+timeout up to 600 s (or none), normalised to 30, as a timeout of 60 was
+also rejected earlier the same day.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 21 ++++++--
+ tests/agent/test_product_repair_fetch.py | 62 ++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 4 deletions(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index e67c02c44..fe76edcea 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -3429,19 +3429,32 @@ def apply_product_research_receipt_recovery(
+         product_research_initial_turn_active(agent)
+         and getattr(agent, "api_mode", "chat_completions") == "chat_completions"
+         and len(calls) == 1
+-        and getattr(agent, "_product_research_receipt_recovery_turn_id", None)
+-        != turn_id
+         and isinstance(messages, (list, tuple))
+     ):
+         return calls, None
++    # The one-shot extraction recovery below is spent once per turn; binding
++    # a generic receipt command to this session is a pure normalization and
++    # stays available after it (2026-10-07: a spent recovery left an unbound
++    # receipt to be rejected and the turn failed).
++    recovery_spent = (
++        getattr(agent, "_product_research_receipt_recovery_turn_id", None) == turn_id
++    )
+ 
+     name, arguments = _product_tool_call_name_arguments(calls[0])
+     if name != "terminal" or arguments is None:
+         return calls, None
+     terminal_reason = product_research_terminal_reason(agent, arguments)
++    timeout = arguments.get("timeout")
+     unbound_receipt_command = (
+         arguments.get("command") in GENERIC_RESEARCH_RECEIPT_COMMANDS
+-        and arguments.get("timeout") == 30
++        and (
++            timeout is None
++            or (
++                isinstance(timeout, (int, float))
++                and not isinstance(timeout, bool)
++                and 0 < timeout <= 600
++            )
++        )
+         and arguments.get("background") in {None, False}
+         and not (set(arguments) - {"command", "timeout", "background"})
+     )
+@@ -3517,7 +3530,7 @@ def apply_product_research_receipt_recovery(
+             "extract_calls_before": extract_count,
+         }
+ 
+-    if extract_count != 1:
++    if recovery_spent or extract_count != 1:
+         return calls, None
+ 
+     post_extract_batches: list[list[str]] = []
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index d39a2c901..2474f7293 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -128,3 +128,65 @@ def test_compare_for_phrasing_is_unchanged():
+     assert extract_targets("Compare the Kindle Paperwhite and Kobo Clara BW for reading at night.") == [
+         "Kindle Paperwhite", "Kobo Clara BW"]
+     assert extract_targets("Research the best robot vacuum under $400 for pet hair.") == []
++
++
++def _two_batch_receipt(timeout):
++    from agent.verified_tool_delivery import GENERIC_RESEARCH_RECEIPT_ABSOLUTE_COMMAND
++    from tests.agent.test_product_route import PROMPT
++
++    official = "https://www.tp-link.com/us/deco-mesh-wifi/product-family/deco-be63/"
++    review = "https://datawiresolutions.com/blog/deco-be63-review"
++    messages = [{"role": "user", "content": PROMPT}]
++    messages += _search_messages("TP-Link Deco BE63 official", [official], "1")
++    messages += _extract_messages([official], "1")
++    messages += _search_messages("Deco BE63 independent review", [review], "2")
++    messages += _extract_messages([review], "2")
++    args = {"command": GENERIC_RESEARCH_RECEIPT_ABSOLUTE_COMMAND}
++    if timeout is not None:
++        args["timeout"] = timeout
++    receipt = SimpleNamespace(id="unbound", function=SimpleNamespace(name="terminal", arguments=json.dumps(args)))
++    return messages, receipt
++
++
++def test_unbound_receipt_is_bound_even_after_the_one_shot_recovery_was_spent():
++    from agent.product_route import apply_product_research_receipt_recovery
++
++    agent = _agent()
++    agent.api_mode = "chat_completions"
++    agent._product_research_receipt_recovery_turn_id = "turn-1"
++    messages, receipt = _two_batch_receipt(30)
++
++    recovered, details = apply_product_research_receipt_recovery(agent, [receipt], messages)
++
++    assert details == {"mode": "receipt_command_session_binding", "extract_calls_before": 2}
++    assert json.loads(receipt.function.arguments) == {
++        "command": bound_product_research_receipt_command(agent.session_id), "timeout": 30}
++
++
++def test_unbound_receipt_with_other_or_missing_timeout_is_normalized():
++    from agent.product_route import apply_product_research_receipt_recovery
++
++    for timeout in (60, None):
++        agent = _agent()
++        agent.api_mode = "chat_completions"
++        messages, receipt = _two_batch_receipt(timeout)
++        recovered, details = apply_product_research_receipt_recovery(agent, [receipt], messages)
++        assert details["mode"] == "receipt_command_session_binding"
++        assert json.loads(receipt.function.arguments)["timeout"] == 30
++
++
++def test_spent_recovery_still_blocks_a_second_extraction_rewrite():
++    from agent.product_route import apply_product_research_receipt_recovery
++
++    agent = _agent()
++    agent.api_mode = "chat_completions"
++    agent._product_research_receipt_recovery_turn_id = "turn-1"
++    messages = [{"role": "user", "content": "Research the best robot vacuum under $400."}]
++    messages += _search_messages("best robot vacuum", ["https://review.example/a", "https://www.roborock.com/q5"], "1")
++    messages += _extract_messages(["https://review.example/a"], "1")
++    detour = SimpleNamespace(id="d", function=SimpleNamespace(
++        name="terminal", arguments=json.dumps({"command": "ls", "timeout": 30})))
++
++    recovered, details = apply_product_research_receipt_recovery(agent, [detour], messages)
++
++    assert details is None and detour.function.name == "terminal"

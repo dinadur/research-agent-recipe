@@ -1,0 +1,79 @@
+From 24869eed769c63e38dce2c7b017dc9a4996c4407 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:31:23 +0000
+Subject: [PATCH 12/18] B70: shadow groundedness retries an oversized judge
+ request once
+
+Clef's llama-server batch is 1024 tokens; on token-dense pages 1400 chars of
+excerpts still reached 1025-1056 tokens (3 errors on the 19:24 air purifier
+answer). Lower the per-claim excerpt budget to 1200 chars and, on any judge
+error, retry once with every excerpt halved (recorded as excerpts_halved).
+Replay of that answer: 21/21 judged, 0 errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_groundedness.py            | 12 ++++++++++--
+ tests/agent/test_product_groundedness.py | 23 +++++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/agent/product_groundedness.py b/agent/product_groundedness.py
+index 87aa48cd5..a4e4c7cc2 100644
+--- a/agent/product_groundedness.py
++++ b/agent/product_groundedness.py
+@@ -314,7 +314,7 @@ _SHADOW_MAX_EXCERPTS = 3
+ _SHADOW_WINDOW_CHARS = 800
+ # Clef's server batch is 1024 tokens; dense spec text runs near 3 chars/token, so
+ # all excerpts of one claim share this budget (the criterion adds ~250 tokens).
+-_SHADOW_EXCERPT_BUDGET_CHARS = 1400
++_SHADOW_EXCERPT_BUDGET_CHARS = 1200
+ _SHADOW_TIMEOUT_SECONDS = 15.0
+ _SHADOW_LOCK = threading.Lock()
+ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\((https://[^)\s]+)\)")
+@@ -569,7 +569,15 @@ def run_groundedness_shadow(
+         }
+         started = time.monotonic()
+         try:
+-            body = _post_guardian(url, payload, headers, _SHADOW_TIMEOUT_SECONDS)
++            try:
++                body = _post_guardian(url, payload, headers, _SHADOW_TIMEOUT_SECONDS)
++            except Exception:
++                # Token-dense pages can still overflow Clef's 1024-token batch;
++                # retry once with every excerpt halved before recording an error.
++                halved = [dict(e, quote=e["quote"][: len(e["quote"]) // 2]) for e in evidence]
++                payload["messages"] = _guardian_messages(claim, halved)
++                record["excerpts_halved"] = True
++                body = _post_guardian(url, payload, headers, _SHADOW_TIMEOUT_SECONDS)
+             verdict = "yes" if _parse_guardian_score(_response_content(body)) else "no"
+             clef = body.get("clef") if isinstance(body.get("clef"), Mapping) else {}
+             record.update(status="judged", verdict=verdict, p_yes=clef.get("p_yes"),
+diff --git a/tests/agent/test_product_groundedness.py b/tests/agent/test_product_groundedness.py
+index 885dce412..1d99331ae 100644
+--- a/tests/agent/test_product_groundedness.py
++++ b/tests/agent/test_product_groundedness.py
+@@ -389,3 +389,26 @@ def test_shadow_excerpts_fit_clef_batch_budget(monkeypatch, tmp_path):
+     import json as _json
+     row = _json.loads((tmp_path / "s.jsonl").read_text().splitlines()[0])
+     assert sum(len(e["quote"]) for e in row["excerpts"]) <= product_groundedness._SHADOW_EXCERPT_BUDGET_CHARS
++
++
++def test_shadow_retries_once_with_halved_excerpts_after_a_judge_error(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_PRODUCT_GROUNDEDNESS_SHADOW_LOG", str(tmp_path / "s.jsonl"))
++    sizes = []
++
++    def post(url, payload, headers, timeout):
++        text = payload["messages"][0]["content"]
++        sizes.append(len(text))
++        if len(sizes) == 1:
++            raise RuntimeError("502 input too large")
++        return _body("yes")
++
++    monkeypatch.setattr(product_groundedness, "_post_guardian", post)
++    page = "spec sheet line " * 400
++    summary = product_groundedness.run_groundedness_shadow(
++        "The model has USB-C ([A](https://a.example/p)).", {"https://a.example/p": page},
++        _agent()._product_research_groundedness_config, "s")
++
++    import json as _json
++    row = _json.loads((tmp_path / "s.jsonl").read_text().splitlines()[0])
++    assert summary["errors"] == 0 and summary["yes"] == 1
++    assert row["excerpts_halved"] is True and sizes[1] < sizes[0]

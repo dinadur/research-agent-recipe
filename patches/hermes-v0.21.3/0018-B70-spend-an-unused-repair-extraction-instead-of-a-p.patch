@@ -1,0 +1,114 @@
+From b99a24d91bdbb00dc4f45df25ba67c512c7bb432 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:16:21 +0000
+Subject: [PATCH 18/18] B70: spend an unused repair extraction instead of a
+ premature receipt
+
+In a granted repair round the model sometimes searched and then requested
+the receipt without extracting (2026-10-08 portable-speaker turn), so the
+round added no evidence and the turn was withheld. While the granted
+extraction is unused, a receipt/terminal call is rewritten into a web_extract
+of the newest searched URLs not yet requested, one per new source family.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 53 ++++++++++++++++++++++++
+ tests/agent/test_product_repair_fetch.py | 24 +++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index ad59c56aa..083c8b89b 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -2881,6 +2881,59 @@ def prepare_product_research_source_mix(
+                 "extract_urls": len(planned),
+             }
+ 
++    if (
++        name == "terminal"
++        and arguments is not None
++        and _product_research_repair_bonus(agent)
++        and extract_count < PRODUCT_RESEARCH_MAX_EXTRACT_CALLS + 1
++        and search_count > 0
++    ):
++        # The repair round granted one search and one extraction; the model
++        # searched and then asked for the receipt without extracting
++        # (2026-10-08 speaker turn).  Spend the granted extraction on the
++        # newest searched URLs that have not been extracted yet.
++        requested: set[str] = set()
++        for message in current_messages:
++            for call in message.get("tool_calls") or []:
++                function = call.get("function") if isinstance(call, Mapping) else None
++                if isinstance(function, Mapping) and function.get("name") == "web_extract":
++                    try:
++                        urls = json.loads(function.get("arguments") or "{}").get("urls") or []
++                    except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
++                        urls = []
++                    if isinstance(urls, str):
++                        urls = [urls]
++                    requested |= {_canonical_url(u) for u in urls if isinstance(u, str)}
++        families = {_product_source_family(u) for u in successful}
++        planned: list[str] = []
++        for batch in reversed(_product_search_url_batches(current_messages)):
++            for url in batch:
++                safe = _safe_product_recovery_url(url)
++                if not safe or _canonical_url(safe) in requested:
++                    continue
++                family = _product_source_family(safe) or safe
++                if family in families:
++                    continue
++                families.add(family)
++                planned.append(safe)
++                if len(planned) == PRODUCT_RESEARCH_RECOVERY_MAX_URLS:
++                    break
++            if len(planned) == PRODUCT_RESEARCH_RECOVERY_MAX_URLS:
++                break
++        if planned:
++            function = getattr(calls[0], "function", None)
++            function.name = "web_extract"
++            function.arguments = json.dumps(
++                {"urls": planned}, ensure_ascii=False, separators=(",", ":")
++            )
++            normalized_calls = [calls[0]] if parallel_terminal_calls else calls
++            return normalized_calls, None, {
++                "mode": "repair_terminal_to_extract",
++                "search_calls": search_count,
++                "extract_calls": extract_count,
++                "extract_urls": len(planned),
++            }
++
+     proposed_query = (
+         arguments.get("query").strip()
+         if name == "web_search"
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index bf557bdac..6ac5a8997 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -350,3 +350,27 @@ def test_model_path_makes_manufacturer_page_official_and_earlier_candidate_can_c
+     assert any("tp-link.com" in u for u in be9700["product_focused_sources"])
+     ok, reasons = _product_receipt_viability(mix, messages[0]["content"])
+     assert ok, reasons
++
++
++def test_repair_round_receipt_without_extract_becomes_the_repair_extract(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    prepare_product_research_source_mix(agent, [receipt], messages)  # grants the repair round
++    assert agent._product_research_repair_grant_turn_id == "turn-1"
++    fresh = ["https://www.rtings.com/vacuum/reviews/roborock/q5-max-plus", "https://www.techradar.com/roborock-q5-max-plus"]
++    messages = messages + _search_messages("Roborock Q5 Max+ independent review", fresh, "3")
++    again = SimpleNamespace(id="receipt-2", function=SimpleNamespace(name="terminal", arguments=receipt.function.arguments))
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [again], messages)
++
++    assert details["mode"] == "repair_terminal_to_extract" and nudge is None
++    assert again.function.name == "web_extract"
++    assert json.loads(again.function.arguments)["urls"] == fresh
++
++
++def test_no_repair_rewrite_without_a_granted_round(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    messages = messages + _search_messages("q", ["https://www.rtings.com/x"], "3")
++    calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
++    assert details["mode"] == "receipt_repair_fetch_granted"

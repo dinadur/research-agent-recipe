@@ -1,0 +1,149 @@
+From 4a6ab30fa31a487622c3226219101afe89cd259d Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 23:10:11 +0000
+Subject: [PATCH 16/18] B70: quality-first drafts keep evidence citations
+ instead of withholding
+
+Rerun of the 11 withheld product prompts on c2e3848 delivered 7; two of the
+remaining four failed only at the final draft check:
+
+- citation_outside_frozen_evidence: links to URLs outside the frozen evidence
+  are now unlinked (label kept, bare URL removed) before validation, so every
+  remaining citation points at fetched evidence; unlinked URLs are logged.
+- citations_missing: bare URLs from the frozen evidence now count as
+  citations alongside Markdown links.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 11 ++++++-
+ agent/quality_first_route.py             | 39 +++++++++++++++++++++++-
+ tests/agent/test_product_repair_fetch.py | 38 +++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index 1a7d3e93a..f36b00843 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -5762,8 +5762,17 @@ def validate_product_research_response(
+         getattr(agent, "_product_research_operator_prompt", "") or ""
+     ).strip()
+     if product_research_quality_first_active(agent):
+-        from agent.quality_first_route import response_diagnostics
++        from agent.quality_first_route import response_diagnostics, strip_outside_citations
+ 
++        response, unlinked = strip_outside_citations(str(response or ""), raw_sources)
++        if unlinked:
++            logger.info(
++                "Product research quality-first unlinked %d citation(s) outside the "
++                "frozen evidence: %s session=%s",
++                len(unlinked),
++                " | ".join(unlinked[:5]),
++                getattr(agent, "session_id", None) or "none",
++            )
+         diagnostics = response_diagnostics(response, original_request, raw_sources)
+         agent._product_research_quality_first_diagnostics = diagnostics
+         if not diagnostics.get("passed"):
+diff --git a/agent/quality_first_route.py b/agent/quality_first_route.py
+index c69455fb1..a8ec5f0bf 100644
+--- a/agent/quality_first_route.py
++++ b/agent/quality_first_route.py
+@@ -283,6 +283,39 @@ def _target_coverage_tokens(target: str) -> list[str]:
+     return [token for token in re.findall(r"[A-Za-z0-9]+", core) if len(token) >= 2]
+ 
+ 
++def strip_outside_citations(text: str, allowed_urls: Sequence[str]) -> tuple[str, list[str]]:
++    """Unlink citations to URLs outside the frozen evidence.
++
++    ``[label](https://outside)`` keeps its label; a bare outside URL is removed
++    (with the parentheses around it).  Every citation left points at frozen
++    evidence, which is what the outside-citation check exists to guarantee.
++    """
++
++    allowlist = {canonical_url(url) for url in allowed_urls if canonical_url(url)}
++    removed: list[str] = []
++
++    def unlink(match: re.Match) -> str:
++        url = match.group(2)
++        if canonical_url(url) in allowlist:
++            return match.group(0)
++        removed.append(url)
++        return match.group(1)
++
++    out = re.sub(r"\[([^\]]+)\]\((https://[^)\s]+)\)", unlink, str(text or ""))
++
++    def drop(match: re.Match) -> str:
++        url = match.group(0)
++        if canonical_url(url) in allowlist:
++            return url
++        removed.append(url)
++        return ""
++
++    out = _URL_RE.sub(drop, out)
++    out = re.sub(r"\(\s*[,;]?\s*\)", "", out)
++    out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
++    return out, removed
++
++
+ def response_diagnostics(
+     response: Any,
+     prompt: str,
+@@ -292,8 +325,12 @@ def response_diagnostics(
+ 
+     text = str(response or "").strip()
+     allowlist = {canonical_url(url) for url in allowed_urls if canonical_url(url)}
+-    cited = [canonical_url(url) for url in _MARKDOWN_URL_RE.findall(text)]
+     all_https = [canonical_url(url) for url in _URL_RE.findall(text)]
++    # Markdown links and bare URLs from the frozen evidence both count as
++    # citations ("... (https://vendor.example/p)" is a common local-model style).
++    cited = [canonical_url(url) for url in _MARKDOWN_URL_RE.findall(text)] + [
++        url for url in all_https if url in allowlist
++    ]
+     outside = sorted({url for url in all_https if url and url not in allowlist})
+     target_missing = [
+         target
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index 9bd8c9f6b..429f0957d 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -270,3 +270,41 @@ def test_quality_first_nudge_names_missing_alternatives_and_citable_urls():
+ 
+     assert "exactly as written" in text and "Fully Jarvis" in text
+     assert "[label](url)" in text and "https://a.example/x" in text
++
++
++def test_strip_outside_citations_keeps_evidence_links_only():
++    from agent.quality_first_route import strip_outside_citations
++
++    text = ("The T9 supports remote sensors [Honeywell](https://www.honeywellhome.com/t9) and costs $199 "
++            "([Best Buy](https://www.bestbuy.com/t9)), per a forum (https://reddit.com/r/x).")
++    out, removed = strip_outside_citations(text, ["https://www.honeywellhome.com/t9"])
++
++    assert "[Honeywell](https://www.honeywellhome.com/t9)" in out
++    assert "bestbuy" not in out and "reddit" not in out and "Best Buy" in out
++    assert "()" not in out and removed == ["https://www.bestbuy.com/t9", "https://reddit.com/r/x"]
++
++
++def test_bare_evidence_urls_count_as_citations():
++    from agent.quality_first_route import response_diagnostics
++
++    d = response_diagnostics("The Level.2 has a 60-mile range (https://www.aventon.com/level2).",
++                             "Research the best e-bike under $2000.", ["https://www.aventon.com/level2"])
++    assert "citations_missing" not in d["defects"]
++
++
++def test_quality_first_validation_unlinks_outside_citation_instead_of_withholding(monkeypatch):
++    from agent import product_route
++
++    monkeypatch.setattr(product_route, "product_research_route_active", lambda a: True)
++    monkeypatch.setattr(product_route, "product_research_quality_first_active", lambda a: True)
++    monkeypatch.setattr(product_route, "start_groundedness_shadow", lambda *a: None, raising=False)
++    agent = SimpleNamespace(
++        _current_turn_id="t1", _product_research_receipt_turn_id="t1",
++        _product_research_receipt_sources=("https://www.honeywellhome.com/t9",),
++        _product_research_receipt_source_texts={}, _product_research_operator_prompt="Research the best thermostat under $250.",
++    )
++    passed, text, reason = product_route.validate_product_research_response(
++        agent, "Buy the T9 under $250 [Honeywell](https://www.honeywellhome.com/t9), see [deal](https://deals.example/t9).")
++
++    assert passed and reason == "quality_first_passed"
++    assert "deals.example" not in text and "deal" in text

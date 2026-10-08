@@ -1,0 +1,403 @@
+From 5664dbd64ae007f73949615683c44ff2cf3898a6 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:28:26 +0000
+Subject: [PATCH 04/18] B70: open-ended research with explicit wiki-save
+ wording stays on the direct-save route
+
+An explicit wiki-save request now keeps product-shaped and multi-entity
+questions ("best options around $1000", "recommend") on the guarded
+generic route, which saves the verified answer directly, instead of the
+approval-based product route. An explicit controller product marker
+still selects the product route, travel requests keep the travel route,
+and requests without save wording route as before.
+
+Open-ended requests (best, options, budget, recommend and so on, without
+an explicit 2-3 way comparison) get a larger bounded budget of 5 searches
+and 3 extract calls, plus a note to identify candidates and always include
+any option the operator names. The controller then waits once for at
+least 4 extracted pages before sealing the receipt; after one deferral it
+seals with what it has. Other requests keep 3 searches and 2 extract
+calls. The receipt helper's upper bounds were raised to match, outside
+this repository. User-authorized on 2026-09-27.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/generic_research_route.py               | 109 ++++++++++++++---
+ agent/research_turn_context.py                |   8 ++
+ .../agent/test_generic_research_open_ended.py | 114 ++++++++++++++++++
+ 3 files changed, 216 insertions(+), 15 deletions(-)
+ create mode 100644 tests/agent/test_generic_research_open_ended.py
+
+diff --git a/agent/generic_research_route.py b/agent/generic_research_route.py
+index 534ffa90f..ee5f03dee 100644
+--- a/agent/generic_research_route.py
++++ b/agent/generic_research_route.py
+@@ -55,6 +55,24 @@ GENERIC_RESEARCH_LENGTH_WITHHELD_RESPONSE = (
+ )
+ GENERIC_RESEARCH_MAX_SEARCH_CALLS = 3
+ GENERIC_RESEARCH_MAX_EXTRACT_CALLS = 2
++# Open-ended requests (B70, 2026-09-27): discovery needs searches before detail, so they get a larger bounded
++# budget and the controller waits for more sources before sealing the receipt.
++GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS = 5
++GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS = 3
++GENERIC_RESEARCH_BROAD_SOURCE_TARGET = 4
++_OPEN_ENDED_RE = re.compile(
++    r"\b(?:best|options?|alternatives?|recommend\w*|which|top|choices?|candidates?|worth|"
++    r"around|under|budget|compare|comparison|versus|vs)\b|\$\s?\d",
++    re.IGNORECASE,
++)
++GENERIC_RESEARCH_BROAD_NOTE = (
++    "[System: This is an open-ended request. You may use up to "
++    f"{GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS} web_search calls and "
++    f"{GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS} web_extract calls. First identify the main candidates, "
++    "always including any product, place or option the operator names as an example, then extract "
++    "official pages and independent hands-on reviews for them. The receipt waits for at least "
++    f"{GENERIC_RESEARCH_BROAD_SOURCE_TARGET} extracted pages while extraction budget remains.]"
++)
+ GENERIC_RESEARCH_FINALIZATION_MAX_TOKENS = 4096
+ GENERIC_RESEARCH_EXACT_SOURCE_BUDGET_ENV = (
+     "HERMES_GENERIC_RESEARCH_EXACT_SOURCE_BUDGET_V1"
+@@ -493,10 +511,12 @@ def requires_generic_research_route(user_message: Any) -> bool:
+     from agent.research_contract import requires_parallel_research_route
+     from agent.travel_route import requires_travel_publication_route
+ 
+-    if (
+-        requires_product_research_route(text)
+-        or requires_travel_publication_route(text)
+-        or requires_parallel_research_route(text)
++    if requires_travel_publication_route(text):
++        return False
++    # An explicit wiki-save request keeps product-shaped and multi-entity questions on this direct-save route
++    # (B70, 2026-09-27); an explicit controller product marker still selects the product route.
++    if not generic_research_direct_save_requested(text) and (
++        requires_product_research_route(text) or requires_parallel_research_route(text)
+     ):
+         return False
+     return (
+@@ -505,6 +525,42 @@ def requires_generic_research_route(user_message: Any) -> bool:
+     )
+ 
+ 
++def generic_research_direct_save_requested(user_message: Any) -> bool:
++    """Wiki-save wording with research intent and no explicit product-route marker."""
++
++    if not isinstance(user_message, str):
++        return False
++    from agent.product_route import PRODUCT_RESEARCH_ROUTE_MARKER
++
++    text = " ".join(user_message.split())
++    return bool(
++        _RESEARCH_INTENT_RE.search(text)
++        and generic_research_save_requested(text)
++        and PRODUCT_RESEARCH_ROUTE_MARKER not in text
++    )
++
++
++def generic_research_broad_request(user_message: Any) -> bool:
++    """Open-ended discovery (best options, budgets, recommendations) without an explicit 2-3 way comparison."""
++
++    if not isinstance(user_message, str):
++        return False
++    text = " ".join(user_message.split())
++    return bool(_OPEN_ENDED_RE.search(text)) and not _comparison_alternatives(text)
++
++
++def _search_budget(agent: Any) -> int:
++    return (GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS
++            if getattr(agent, "_generic_research_broad", False) is True
++            else GENERIC_RESEARCH_MAX_SEARCH_CALLS)
++
++
++def _extract_budget(agent: Any) -> int:
++    return (GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS
++            if getattr(agent, "_generic_research_broad", False) is True
++            else GENERIC_RESEARCH_MAX_EXTRACT_CALLS)
++
++
+ def generic_research_save_requested(user_message: Any) -> bool:
+     """True when the operator explicitly asks to save this research to the wiki."""
+ 
+@@ -546,6 +602,8 @@ def arm_generic_research_route_for_turn(
+     agent._generic_research_save_requested = generic_research_save_requested(
+         str(user_message)
+     )
++    agent._generic_research_broad = generic_research_broad_request(str(user_message))
++    agent._generic_research_broad_deferred_turn_id = None
+     agent._generic_research_comparison_alternatives = _comparison_alternatives(
+         str(user_message)
+     )
+@@ -685,9 +743,7 @@ def generic_research_source_budget_rejection(
+             rejection_count + 1
+         )
+         agent._generic_research_source_budget_closed_turn_id = turn_id
+-        agent._generic_research_extract_call_count = (
+-            GENERIC_RESEARCH_MAX_EXTRACT_CALLS
+-        )
++        agent._generic_research_extract_call_count = _extract_budget(agent)
+         return GenericResearchSourceBudgetRejection(
+             code="generic_research_source_budget_retry_exhausted",
+             message=(
+@@ -729,10 +785,10 @@ def generic_research_tool_reason(
+             count = int(
+                 getattr(agent, "_generic_research_search_call_count", 0) or 0
+             )
+-            if count >= GENERIC_RESEARCH_MAX_SEARCH_CALLS:
++            if count >= _search_budget(agent):
+                 return (
+                     "The generic research search budget of "
+-                    f"{GENERIC_RESEARCH_MAX_SEARCH_CALLS} calls is exhausted. Do not "
++                    f"{_search_budget(agent)} calls is exhausted. Do not "
+                     "call web_search again - further calls are rejected, and repeating "
+                     "a rejected call ends this research turn with no answer delivered. "
+                     "Instead: extract from the most promising result you already hold, "
+@@ -759,10 +815,10 @@ def generic_research_tool_reason(
+             count = int(
+                 getattr(agent, "_generic_research_extract_call_count", 0) or 0
+             )
+-            if count >= GENERIC_RESEARCH_MAX_EXTRACT_CALLS:
++            if count >= _extract_budget(agent):
+                 return (
+                     "The generic research extraction budget of "
+-                    f"{GENERIC_RESEARCH_MAX_EXTRACT_CALLS} calls is exhausted. Do not "
++                    f"{_extract_budget(agent)} calls is exhausted. Do not "
+                     "call web_extract again - further calls are rejected, and repeating "
+                     "a rejected call ends this research turn with no answer delivered. "
+                     "Write the brief from the sources you have already receipted, and "
+@@ -1081,7 +1137,7 @@ def apply_generic_research_primary_recovery(
+             }
+         if (
+             int(getattr(agent, "_generic_research_search_call_count", 0) or 0)
+-            >= GENERIC_RESEARCH_MAX_SEARCH_CALLS
++            >= _search_budget(agent)
+         ):
+             continue
+         query = _primary_recovery_query(agent)
+@@ -1295,7 +1351,7 @@ def prepare_generic_research_controller_receipt(
+     if (
+         comparison_provenance_observed
+         and missing
+-        and extract_count < GENERIC_RESEARCH_MAX_EXTRACT_CALLS
++        and extract_count < _extract_budget(agent)
+     ):
+         return None, {
+             "mode": "generic_controller_comparison_coverage_not_ready",
+@@ -1313,15 +1369,35 @@ def prepare_generic_research_controller_receipt(
+                 "label any still-missing evidence.]"
+             ),
+         }
++    if (
++        getattr(agent, "_generic_research_broad", False) is True
++        and 2 <= len(admissible_sources) < GENERIC_RESEARCH_BROAD_SOURCE_TARGET
++        and extract_count < _extract_budget(agent)
++        and getattr(agent, "_generic_research_broad_deferred_turn_id", None) != turn_id
++    ):
++        # At most one deferral per turn: one more extraction round, then seal with what is there.
++        agent._generic_research_broad_deferred_turn_id = turn_id
++        return None, {
++            "mode": "generic_controller_broad_coverage_not_ready",
++            "successful_sources": len(sources),
++            "admissible_sources": len(admissible_sources),
++            "nudge": (
++                "[System: The open-ended receipt is not ready: "
++                f"{len(admissible_sources)} of {GENERIC_RESEARCH_BROAD_SOURCE_TARGET} pages. Use the "
++                "remaining web_extract call(s) on other exact HTTPS URLs already returned by search, "
++                "covering candidates or independent reviews not yet extracted and any option the "
++                "operator named. You may search again if budget remains.]"
++            ),
++        }
+     if len(admissible_sources) < 2:
+         nudge = None
+-        if extract_count < GENERIC_RESEARCH_MAX_EXTRACT_CALLS:
++        if extract_count < _extract_budget(agent):
+             recovery_query = _primary_recovery_query(agent)
+             if primary_required:
+                 search_count = int(
+                     getattr(agent, "_generic_research_search_call_count", 0) or 0
+                 )
+-                if search_count < GENERIC_RESEARCH_MAX_SEARCH_CALLS:
++                if search_count < _search_budget(agent):
+                     nudge = (
+                         "[System: The generic research receipt is not ready. Use "
+                         f"the remaining web_search with this exact query: "
+@@ -1491,6 +1567,7 @@ __all__ = [
+     "GENERIC_RESEARCH_LENGTH_WITHHELD_RESPONSE",
+     "GENERIC_RESEARCH_MAX_EXTRACT_CALLS",
+     "GENERIC_RESEARCH_MAX_SEARCH_CALLS",
++    "GENERIC_RESEARCH_BROAD_NOTE",
+     "GENERIC_RESEARCH_ROUTE_NOTE",
+     "GENERIC_RESEARCH_SAVE_NOTE",
+     "GENERIC_RESEARCH_WITHHELD_RESPONSE",
+@@ -1500,6 +1577,8 @@ __all__ = [
+     "generic_research_finalization_nudge",
+     "generic_research_finalization_request_overrides",
+     "generic_research_receipt_bound",
++    "generic_research_broad_request",
++    "generic_research_direct_save_requested",
+     "generic_research_route_active",
+     "generic_research_save_requested",
+     "generic_research_source_budget_rejection",
+diff --git a/agent/research_turn_context.py b/agent/research_turn_context.py
+index 62a559c7f..2bc1bce9e 100644
+--- a/agent/research_turn_context.py
++++ b/agent/research_turn_context.py
+@@ -85,9 +85,11 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+             requires_product_research_route,
+         )
+         from agent.generic_research_route import (
++            GENERIC_RESEARCH_BROAD_NOTE,
+             GENERIC_RESEARCH_ROUTE_NOTE,
+             GENERIC_RESEARCH_SAVE_NOTE,
+             arm_generic_research_route_for_turn,
++            generic_research_direct_save_requested,
+             requires_generic_research_route,
+         )
+ 
+@@ -110,8 +112,11 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+         research_lite_requested = _explicit_simple_research_workflow_requested(
+             route_message
+         )
++        # An explicit wiki-save request takes the direct-save generic route, not the approval-based product route.
++        direct_save_requested = generic_research_direct_save_requested(route_message)
+         product_route_requested = bool(
+             not research_lite_requested
++            and not direct_save_requested
+             and requires_product_research_route(route_message)
+         )
+         if product_route_requested and isinstance(route_message, str):
+@@ -134,6 +139,7 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+         product_session_active = bool(
+             not research_lite_requested
+             and not travel_route_requested
++            and not direct_save_requested
+             and arm_product_research_session(
+                 agent,
+                 route_message,
+@@ -192,6 +198,8 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+                 persist_user_message = route_message
+                 agent._persist_user_message_override = route_message
+             route_note = GENERIC_RESEARCH_ROUTE_NOTE
++            if getattr(agent, "_generic_research_broad", False) is True:
++                route_note = f"{route_note}\n\n{GENERIC_RESEARCH_BROAD_NOTE}"
+             if getattr(agent, "_generic_research_save_requested", False) is True:
+                 route_note = f"{route_note}\n\n{GENERIC_RESEARCH_SAVE_NOTE}"
+             user_message = f"{route_note}\n\n{user_message}"
+diff --git a/tests/agent/test_generic_research_open_ended.py b/tests/agent/test_generic_research_open_ended.py
+new file mode 100644
+index 000000000..7c0b24203
+--- /dev/null
++++ b/tests/agent/test_generic_research_open_ended.py
+@@ -0,0 +1,114 @@
++"""Open-ended research with explicit wiki-save wording (B70, 2026-09-27): routing stays on the direct-save generic
++route, open-ended requests get a larger bounded budget, and the controller waits once for more sources before
++sealing the receipt. No network, model or vault."""
++import json
++from types import SimpleNamespace
++
++from agent.generic_research_route import (
++    GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS,
++    GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS,
++    arm_generic_research_route_for_turn,
++    generic_research_broad_request,
++    generic_research_direct_save_requested,
++    generic_research_tool_reason,
++    prepare_generic_research_controller_receipt,
++    requires_generic_research_route,
++)
++from agent.product_route import requires_product_research_route
++
++ORIGINAL = (
++    "I'd like to research the purchase of a 3D printer around $1000. I'm looking for something more open source "
++    "like the snapmaker U1 that I can work with an agent to print to via API/MCP.  Can you research the best options "
++    "and write a wiki article?"
++)
++PRODUCT_SHAPED_SAVE = (
++    "Research open-source-friendly 3D printers around $1000, like the Snapmaker U1, that an AI agent can control "
++    "through a local API or MCP. Cover the best options and save it as a wiki article."
++)
++PRODUCT_SHAPED_NO_SAVE = (
++    "Research 3D printers around $1000 that an AI agent can control via API or MCP, like the Snapmaker U1. "
++    "Compare the best options and recommend one."
++)
++NAMED = (
++    "Research the Snapmaker U1, Prusa Core One and Bambu Lab P1S: open-source firmware, local API or MCP control "
++    "for an AI agent, price and build volume. Save it as a wiki article."
++)
++
++
++def _agent():
++    return SimpleNamespace(_current_turn_id="turn-1", api_mode="chat_completions", session_id="session-1",
++                           _product_research_route_session_latched=False,
++                           _travel_publication_route_session_latched=False)
++
++
++def _extract(urls):
++    return [
++        {"role": "user", "content": ORIGINAL},
++        {"role": "assistant", "content": "", "tool_calls": [{"id": "x1", "type": "function", "function": {
++            "name": "web_extract", "arguments": json.dumps({"urls": urls})}}]},
++        {"role": "tool", "name": "web_extract", "tool_call_id": "x1", "content": json.dumps(
++            {"results": [{"url": url, "content": f"printer details from {url}"} for url in urls]})},
++    ]
++
++
++def test_original_prompt_takes_direct_save_route_as_open_ended():
++    assert requires_generic_research_route(ORIGINAL) is True
++    assert generic_research_direct_save_requested(ORIGINAL) is True
++    assert generic_research_broad_request(ORIGINAL) is True
++    agent = _agent()
++    assert arm_generic_research_route_for_turn(agent, ORIGINAL, "turn-1") is True
++    assert agent._generic_research_save_requested is True and agent._generic_research_broad is True
++
++
++def test_save_keeps_product_shaped_request_off_the_product_route():
++    assert requires_product_research_route(PRODUCT_SHAPED_SAVE) is True  # unchanged detector
++    assert generic_research_direct_save_requested(PRODUCT_SHAPED_SAVE) is True
++    assert requires_generic_research_route(PRODUCT_SHAPED_SAVE) is True
++    # Without save wording the product route keeps the request, as before.
++    assert requires_product_research_route(PRODUCT_SHAPED_NO_SAVE) is True
++    assert requires_generic_research_route(PRODUCT_SHAPED_NO_SAVE) is False
++    # An explicit product-route marker still wins.
++    assert generic_research_direct_save_requested("HERMES_PRODUCT_RESEARCH_ROUTE_V1 " + PRODUCT_SHAPED_SAVE) is False
++
++
++def test_named_comparison_is_not_open_ended_and_keeps_the_default_budget():
++    assert generic_research_broad_request(NAMED) is False
++    agent = _agent()
++    assert arm_generic_research_route_for_turn(agent, NAMED, "turn-1") is True
++    for _ in range(3):
++        assert generic_research_tool_reason(agent, "web_search", {"query": "q"}) is None
++    assert "exhausted" in generic_research_tool_reason(agent, "web_search", {"query": "q"})
++
++
++def test_open_ended_budget_is_larger_but_bounded():
++    agent = _agent()
++    arm_generic_research_route_for_turn(agent, ORIGINAL, "turn-1")
++    for _ in range(GENERIC_RESEARCH_BROAD_MAX_SEARCH_CALLS):
++        assert generic_research_tool_reason(agent, "web_search", {"query": "q"}) is None
++    assert "exhausted" in generic_research_tool_reason(agent, "web_search", {"query": "q"})
++    for index in range(GENERIC_RESEARCH_BROAD_MAX_EXTRACT_CALLS):
++        assert generic_research_tool_reason(agent, "web_extract", {"urls": [f"https://e{index}.example/a"]}) is None
++    assert "exhausted" in generic_research_tool_reason(agent, "web_extract", {"urls": ["https://e9.example/a"]})
++
++
++def test_open_ended_receipt_waits_once_then_seals():
++    agent = _agent()
++    arm_generic_research_route_for_turn(agent, ORIGINAL, "turn-1")
++    agent._generic_research_extract_call_count = 1
++    call = SimpleNamespace(function=SimpleNamespace(name="web_extract", arguments="{}"))
++    messages = _extract(["https://us.snapmaker.com/products/u1", "https://www.bambulab.com/p1s"])
++    arguments, details = prepare_generic_research_controller_receipt(agent, [call], messages)
++    assert arguments is None and details["mode"] == "generic_controller_broad_coverage_not_ready"
++    assert "named" in details["nudge"]
++    arguments, details = prepare_generic_research_controller_receipt(agent, [call], messages)
++    assert arguments is not None and details["mode"] == "generic_controller_auto_receipt"
++
++
++def test_open_ended_receipt_seals_immediately_with_enough_sources():
++    agent = _agent()
++    arm_generic_research_route_for_turn(agent, ORIGINAL, "turn-1")
++    agent._generic_research_extract_call_count = 1
++    call = SimpleNamespace(function=SimpleNamespace(name="web_extract", arguments="{}"))
++    urls = [f"https://site{index}.example/printer" for index in range(4)]
++    arguments, details = prepare_generic_research_controller_receipt(agent, [call], _extract(urls))
++    assert arguments is not None and details["successful_sources"] == 4

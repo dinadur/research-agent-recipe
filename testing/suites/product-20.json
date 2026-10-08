@@ -1,0 +1,184 @@
+{
+ "tasks": [
+  {
+   "id": "n01-cordless-drill",
+   "prompt": "Research the best cordless drill under $150 for occasional home projects, comparing the DeWalt DCD771C2, Milwaukee M18 2801-22CT and Ryobi PBLDD01K. Use each manufacturer's official product page for torque, battery voltage and included batteries, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n02-wireless-earbuds",
+   "prompt": "Research the best wireless earbuds under $250 for commuting, comparing the Apple AirPods Pro 2, Sony WF-1000XM5 and Samsung Galaxy Buds3 Pro. Use each manufacturer's official product page for noise cancelling, battery life and water resistance, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n03-air-fryer",
+   "prompt": "Research the best air fryer under $150 for a family of four, comparing the Ninja DZ201 Foodi, Cosori TurboBlaze 6-Quart and Instant Vortex Plus 6-Quart. Use each manufacturer's official product page for capacity, wattage and cooking functions, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n04-portable-ssd",
+   "prompt": "Research the best 2TB portable SSD under $200 for video editing on a laptop, comparing the Samsung T7 Shield, SanDisk Extreme Portable SSD V2 and Crucial X9 Pro. Use each manufacturer's official product page for read/write speed, interface and durability rating, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n05-smart-thermostat",
+   "prompt": "Research the best smart thermostat under $250 for a two-story house, comparing the Google Nest Learning Thermostat (4th gen), ecobee Smart Thermostat Premium and Honeywell Home T9. Use each manufacturer's official product page for remote sensors, C-wire requirement and smart-home compatibility, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n06-mechanical-keyboard",
+   "prompt": "Research the best wireless mechanical keyboard under $200 for programming, comparing the Keychron K8 Pro, Logitech MX Mechanical and NuPhy Air75 V2. Use each manufacturer's official product page for switch options, battery life and connectivity, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n07-video-doorbell",
+   "prompt": "Research the best video doorbell under $200 without a required subscription, comparing the Eufy Video Doorbell E340, Google Nest Doorbell (battery) and Ring Battery Doorbell Plus. Use each manufacturer's official product page for resolution, power options and local storage, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n08-standing-desk",
+   "prompt": "Research the best electric standing desk under $600 for a home office, comparing the Uplift V2, Fully Jarvis and FlexiSpot E7. Use each manufacturer's official product page for height range, weight capacity and warranty, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n09-portable-power-station",
+   "prompt": "Research the best portable power station under $1000 for camping, comparing the EcoFlow DELTA 2, Jackery Explorer 1000 v2 and Anker SOLIX C1000. Use each manufacturer's official product page for capacity, AC output and recharge time, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "n10-e-bike",
+   "prompt": "Research the best commuter e-bike under $2000, comparing the Rad Power Bikes RadCity 5 Plus, Aventon Level.2 and Lectric XP Trike. Use each manufacturer's official product page for range, motor power and weight, and a current retailer or manufacturer price for each. Recommend one model plus two alternatives and cite the pages.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o01-dehumidifier",
+   "prompt": "Research the best dehumidifier under $300 for a damp 1,000 sq ft basement. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o02-office-chair",
+   "prompt": "Research the best ergonomic office chair under $500 for long workdays with lower back pain. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o03-blender",
+   "prompt": "Research the best blender under $200 for daily smoothies with frozen fruit. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o04-webcam",
+   "prompt": "Research the best webcam under $150 for video calls in a dim home office. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o05-rice-cooker",
+   "prompt": "Research the best rice cooker under $200 for brown rice and a small household. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o06-electric-toothbrush",
+   "prompt": "Research the best electric toothbrush under $150 for sensitive gums. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o07-monitor-arm",
+   "prompt": "Research the best monitor arm under $150 for a 32-inch monitor on a home desk. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o08-portable-speaker",
+   "prompt": "Research the best portable Bluetooth speaker under $200 for beach trips. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o09-wifi-router",
+   "prompt": "Research the best Wi-Fi 7 router under $400 for a gigabit fiber connection in an apartment. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  },
+  {
+   "id": "o10-kids-tablet",
+   "prompt": "Research the best tablet under $300 for a 10-year-old's schoolwork and reading. Recommend one model plus two alternatives and cite your sources.",
+   "minimum_response_chars": 400,
+   "timeout_seconds": 1500,
+   "fresh_session": true,
+   "require_gateway_activity": true,
+   "continue_on_failure": true
+  }
+ ]
+}

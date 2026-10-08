@@ -1,0 +1,1275 @@
+From 79e6e104612d4b996929bf02ceef95cd76efa825 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 08:46:04 +0000
+Subject: [PATCH 01/18] Port bounded B70 runtime controls to Hermes 0.21.3
+
+---
+ agent/retrieval_guardrails.py                 |  33 +++
+ agent/tool_guardrails.py                      |  31 ++-
+ agent/transports/chat_completions.py          |   2 +-
+ agent/travel_terminal_policy.py               |  94 +++++++
+ gateway/config.py                             |   4 +
+ gateway/config_loader.py                      |   2 +-
+ gateway/run_turn.py                           |  14 +-
+ gateway/run_verified_receipt.py               |  52 ++++
+ gateway/slash_commands.py                     |   3 +
+ gateway/verified_receipt_direct_replay.py     | 257 ++++++++++++++++++
+ locales/en.yaml                               |   1 +
+ tests/agent/test_b70_retrieval_guardrails.py  | 128 +++++++++
+ .../agent/test_tool_call_guardrail_runtime.py |  27 ++
+ .../agent/transports/test_chat_completions.py |  77 ++++++
+ tests/gateway/test_config.py                  |  20 ++
+ tests/gateway/test_gateway_silence_tokens.py  | 110 ++++++++
+ tests/gateway/test_update_command.py          |  34 ++-
+ .../test_terminal_foreground_timeout_cap.py   |  73 +++++
+ tools/terminal_tool.py                        |  10 +-
+ 19 files changed, 964 insertions(+), 8 deletions(-)
+ create mode 100644 agent/retrieval_guardrails.py
+ create mode 100644 agent/travel_terminal_policy.py
+ create mode 100644 gateway/run_verified_receipt.py
+ create mode 100644 gateway/verified_receipt_direct_replay.py
+ create mode 100644 tests/agent/test_b70_retrieval_guardrails.py
+
+diff --git a/agent/retrieval_guardrails.py b/agent/retrieval_guardrails.py
+new file mode 100644
+index 000000000..bd15618df
+--- /dev/null
++++ b/agent/retrieval_guardrails.py
+@@ -0,0 +1,33 @@
++"""B70 retrieval policy shared by the turn controller's existing decision path."""
++
++BOUNDED_RETRIEVAL_TOOLS = frozenset({"web_search", "web_extract"})
++_PROVIDER_TOOLS = BOUNDED_RETRIEVAL_TOOLS | {"x_search"}
++_TERMINAL_MARKERS = (
++    "http 402", "http status 402", "status code 402", '"status":402',
++    '"status": 402', '"status_code":402', '"status_code": 402',
++    "402 payment required", "payment required", "insufficient credit",
++    "insufficient balance", "credit balance exhausted", "billing quota exhausted",
++)
++
++RETRIEVAL_LIMIT_MESSAGE = (
++    "The configured retrieval allowance for this turn is complete. "
++    "Do not call web_search or web_extract again. Synthesize the best "
++    "answer now from the evidence already collected, clearly stating "
++    "any remaining uncertainty."
++)
++
++
++def is_terminal_provider_failure(tool_name: str, result: str | None) -> bool:
++    if tool_name not in _PROVIDER_TOOLS or not isinstance(result, str):
++        return False
++    return any(marker in result[:4000].lower() for marker in _TERMINAL_MARKERS)
++
++
++def terminal_provider_failure_hint(tool_name: str, count: int) -> str:
++    return (
++        f"{tool_name} reported a terminal provider billing or credit failure "
++        f"({count} time(s) this turn). Do not retry this provider path. "
++        "If the evidence already collected is sufficient, synthesize the answer now "
++        "and state any resulting limitation. Otherwise try one genuinely different "
++        "retrieval tool or direct source path; if none is available, report the blocker."
++    )
+diff --git a/agent/tool_guardrails.py b/agent/tool_guardrails.py
+index 1d28df2b7..e5e8ec163 100644
+--- a/agent/tool_guardrails.py
++++ b/agent/tool_guardrails.py
+@@ -11,10 +11,15 @@ import hashlib
+ import json
+ from collections import deque
+ from dataclasses import asdict, dataclass, field, fields
++from threading import Lock
+ from typing import Any, Mapping
+ 
+ from utils import safe_json_loads
+ from agent.tool_result_classification import file_mutation_result_landed
++from agent.retrieval_guardrails import (
++    BOUNDED_RETRIEVAL_TOOLS, RETRIEVAL_LIMIT_MESSAGE,
++    is_terminal_provider_failure, terminal_provider_failure_hint,
++)
+ 
+ 
+ IDEMPOTENT_TOOL_NAMES = frozenset({
+@@ -127,6 +132,7 @@ class ToolCallGuardrailConfig:
+     same_tool_failure_halt_after: int = 8
+     no_progress_warn_after: int = 2
+     no_progress_block_after: int = 5
++    retrieval_call_limit: int = 0
+     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
+     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
+     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
+@@ -149,7 +155,11 @@ class ToolCallGuardrailConfig:
+             return _int_at_least(nested, getattr(d, name), 1)
+ 
+         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
+-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
++        return cls(
++            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
++            retrieval_call_limit=_int_at_least(data.get("retrieval_call_limit"), 0, 0),
++            **flags, **thresholds,
++        )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -180,7 +190,7 @@ class ToolCallSignature:
+ class ToolGuardrailDecision:
+     """Decision returned by the tool-call guardrail controller."""
+ 
+-    action: str = "allow"  # allow | warn | block | halt
++    action: str = "allow"  # allow | warn | skip | block | halt
+     code: str = "allow"
+     message: str = ""
+     tool_name: str = ""
+@@ -300,6 +310,7 @@ class ToolCallGuardrailController:
+ 
+     def __init__(self, config: ToolCallGuardrailConfig | None = None):
+         self.config = config or ToolCallGuardrailConfig()
++        self._retrieval_lock = Lock()
+         self.reset_for_turn()
+ 
+     def reset_for_turn(self) -> None:
+@@ -328,6 +339,8 @@ class ToolCallGuardrailController:
+         self._persisted_result_paths: dict[str, str] = {}
+         self._turn_web_search_count = 0
+         self._turn_subagent_count = 0
++        with self._retrieval_lock:
++            self._retrieval_call_count = 0
+ 
+     @property
+     def halt_decision(self) -> ToolGuardrailDecision | None:
+@@ -350,6 +363,15 @@ class ToolCallGuardrailController:
+         signature = ToolCallSignature.from_call(tool_name, args)
+         allow = ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+ 
++        if tool_name in BOUNDED_RETRIEVAL_TOOLS and self.config.retrieval_call_limit:
++            with self._retrieval_lock:
++                if self._retrieval_call_count >= self.config.retrieval_call_limit:
++                    return self._decide(
++                        "skip", "retrieval_call_limit_reached", tool_name,
++                        self._retrieval_call_count, signature, message=RETRIEVAL_LIMIT_MESSAGE,
++                    )
++                self._retrieval_call_count += 1
++
+         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
+         cap_block = self._check_loop_cap(tool_name, args, signature)
+         if cap_block is not None or not self.config.hard_stop_enabled:
+@@ -395,6 +417,11 @@ class ToolCallGuardrailController:
+                 and same_count >= self.config.same_tool_failure_halt_after
+             ):
+                 return self._decide("halt", "same_tool_failure_halt", tool_name, same_count, signature)
++            if warnings and is_terminal_provider_failure(tool_name, result):
++                return self._decide(
++                    "warn", "terminal_provider_failure_warning", tool_name, same_count,
++                    signature, message=terminal_provider_failure_hint(tool_name, same_count),
++                )
+             if warnings and exact_count >= self.config.exact_failure_warn_after:
+                 return self._decide("warn", "repeated_exact_failure_warning", tool_name, exact_count, signature)
+             if warnings and same_count >= self.config.same_tool_failure_warn_after:
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index 2e4a6d95e..d1327ce5d 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -331,7 +331,7 @@ def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:
+         for tc_idx, tc in enumerate(tool_calls):
+             if not isinstance(tc, dict):
+                 continue
+-            keys = [k for k in _STRIP_TC_KEYS if k in tc]
++            keys = [k for k in tc if k in _STRIP_TC_KEYS or (isinstance(k, str) and k.startswith("_"))]
+             if strip_extra_content and "extra_content" in tc:
+                 keys.append("extra_content")
+             if keys:
+diff --git a/agent/travel_terminal_policy.py b/agent/travel_terminal_policy.py
+new file mode 100644
+index 000000000..eff10994e
+--- /dev/null
++++ b/agent/travel_terminal_policy.py
+@@ -0,0 +1,94 @@
++"""B70 travel controller admission, independent of the research runtime.
++
++Only the existing routed controller shapes receive foreground headroom. Other
++long commands retain upstream's tracked-background behavior. The vault must be
++configured explicitly; historical Windows defaults are not runtime authority.
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import re
++import shlex
++
++from hermes_constants import get_hermes_home
++
++_SHELL_CONTROL = re.compile(r"&&|\|\||[;&|<>`]|\r|\n|\$\(")
++_RUNNER_MODULE = "agent.research_harness.travel_runner"
++_CONTROLLER_NAME = "run_hermes_travel_pipeline.py"
++_OPTION_LIMITS = {"--max-turns": (1, 4), "--timeout": (1, 600), "--min-included": (1, 12)}
++_REUSE_OPTIONS = {"--reuse-valid-extraction", "--reuse-valid-review"}
++CONTROLLER_FOREGROUND_MAX_TIMEOUT = 900
++
++
++def _under_raw(value: str, raw_root: Path) -> bool:
++    path = Path(value).expanduser()
++    if not path.is_absolute():
++        return False
++    try:
++        path.resolve().relative_to(raw_root)
++    except (OSError, RuntimeError, ValueError):
++        return False
++    return True
++
++
++def travel_controller_foreground_timeout_allowed(command, timeout) -> bool:
++    if (not isinstance(command, str) or not isinstance(timeout, int)
++            or isinstance(timeout, bool) or not 0 < timeout <= CONTROLLER_FOREGROUND_MAX_TIMEOUT
++            or _SHELL_CONTROL.search(command)):
++        return False
++    vault = os.getenv("OBSIDIAN_VAULT_PATH")
++    if not vault:
++        return False
++    try:
++        raw_root = (Path(vault).expanduser() / "raw" / "travel").resolve()
++        tokens = shlex.split(command, posix=True)
++        if not tokens or Path(tokens[0]).name not in {"python", "python3"}:
++            return False
++        if tokens[1:3] == ["-m", _RUNNER_MODULE]:
++            return (len(tokens) == 4 and Path(tokens[3]).suffix.casefold() == ".json"
++                    and _under_raw(tokens[3], raw_root))
++        if len(tokens) < 4:
++            return False
++        script = Path(tokens[1]).expanduser()
++        expected = get_hermes_home() / "skills" / "travel-planning" / "scripts" / _CONTROLLER_NAME
++        if (not script.is_absolute() or script.name != _CONTROLLER_NAME
++                or script.resolve() != expected.resolve()
++                or not all(_under_raw(value, raw_root) for value in tokens[2:4])):
++            return False
++        index = 4
++        while index < len(tokens):
++            option = tokens[index]
++            if option in _REUSE_OPTIONS:
++                index += 1
++                continue
++            limits = _OPTION_LIMITS.get(option)
++            if limits is None or index + 1 >= len(tokens):
++                return False
++            if not limits[0] <= int(tokens[index + 1]) <= limits[1]:
++                return False
++            index += 2
++        return True
++    except (OSError, RuntimeError, ValueError):
++        return False
++
++
++def canonical_travel_terminal_block(command: str) -> str | None:
++    """Preserve the installed guard against terminal bypass of the publisher.
++
++    This string-path guard is one layer; routed tool admission and file-write
++    guards are also required before the complete research lane can be enabled.
++    """
++    vault = os.getenv("OBSIDIAN_VAULT_PATH")
++    if not vault:
++        return None
++    normalized = command.replace("\\", "/").lower()
++    root = vault.replace("\\", "/").rstrip("/").lower()
++    if not any(f"{root}/{sub}" in normalized for sub in ("travel/destinations", "travel/active")):
++        return None
++    return (
++        "Command references a canonical travel vault path (travel/destinations/ or travel/active/). "
++        "Read pages with read_file and publish changes only through the receipt-only "
++        "publisher under the configured Hermes home's skills/travel-planning/scripts/publish_travel.py. "
++        "Draft work belongs under raw/travel/."
++    )
+diff --git a/gateway/config.py b/gateway/config.py
+index 82de453ef..4c25d0d27 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -514,6 +514,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
+ 
+ # Top-level bool-ish keys read verbatim (no nested ``gateway.`` fallback) with their defaults.
+ _TOPLEVEL_BOOL_DEFAULTS = {
++    "allow_update_command": True,
+     "write_sessions_json": True, "always_log_local": True, "filter_silence_narration": True,
+     "group_sessions_per_user": True, "thread_sessions_per_user": False,
+ }
+@@ -531,6 +532,8 @@ class GatewayConfig:
+     # compatibility with external tooling and downgrade safety; set gateway.write_sessions_json: false in
+     # config.yaml to stop producing the file.
+     write_sessions_json: bool = True
++    # Operator-managed installs can prohibit detached, in-place chat updates.
++    allow_update_command: bool = True
+     always_log_local: bool = True  # Always save cron outputs to local files
+     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
+     # channels; a substrate guard that survives prompt drift.
+@@ -569,6 +572,7 @@ class GatewayConfig:
+ 
+     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
+     _SCALAR_DICT_FIELDS = (
++        "allow_update_command",
+         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
+         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
+         "max_concurrent_sessions", "multiplex_profiles",
+diff --git a/gateway/config_loader.py b/gateway/config_loader.py
+index 9ed004284..38798fde8 100644
+--- a/gateway/config_loader.py
++++ b/gateway/config_loader.py
+@@ -78,7 +78,7 @@ _TOPLEVEL_BRIDGE: tuple = (
+     ("systemd_watchdog_seconds", "systemd_watchdog_seconds", "nested", None, None),
+     ("streaming", "streaming", "dict", None, None),
+     *_presence(
+-        "reset_triggers", "always_log_local", "write_sessions_json", "loop_watchdog",
++        "reset_triggers", "always_log_local", "write_sessions_json", "loop_watchdog", "allow_update_command",
+         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s", "loop_watchdog_max_strikes",
+         "filter_silence_narration",
+     ),
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 38b586bde..d11690901 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -2043,12 +2043,22 @@ class GatewayTurnMixin:
+                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                 return None
+ 
++            from gateway.run_verified_receipt import recover_verified_receipt
++            _verified_replay = await recover_verified_receipt(
++                self, agent_result, platform=_platform_name,
++                session_id=_run_start_session_id, prompt=message_text,
++            )
+             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
+                 agent_result, source, history, session_entry, session_key,
+                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
+             )
+-            response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+-            _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
++            # Receipt recovery delivers the exact committed answer; display
++            # decoration must not rewrite those verified bytes.
++            if _verified_replay is not None:
++                response = _verified_replay.content
++            else:
++                response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
++            _footer_line = "" if _verified_replay is not None else self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
+             # Streaming already delivered the body: the footer goes out as a trailing send instead.
+             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+                 response = f"{response}\n\n{_footer_line}"
+diff --git a/gateway/run_verified_receipt.py b/gateway/run_verified_receipt.py
+new file mode 100644
+index 000000000..35264e305
+--- /dev/null
++++ b/gateway/run_verified_receipt.py
+@@ -0,0 +1,52 @@
++"""Carry B70's one-attempt receipt recovery through the current gateway phases."""
++import asyncio
++import logging
++import os
++from pathlib import Path
++
++from hermes_constants import get_hermes_home
++from gateway.verified_receipt_direct_replay import prepare_verified_receipt_direct_replay
++
++logger = logging.getLogger(__name__)
++
++
++async def recover_verified_receipt(runner, result, *, platform, session_id, prompt):
++    response = result.get("final_response") or ""
++    if (
++        os.getenv("HERMES_VERIFIED_RECEIPT_DIRECT_REPLAY_CANARY", "") != "1"
++        or platform.lower() != "telegram"
++        or runner._session_db is None
++        or runner._is_intentional_silence(result, response)
++        or (result.get("session_id") and result["session_id"] != session_id)
++    ):
++        return
++    home = get_hermes_home()
++    try:
++        replay = await asyncio.to_thread(
++            prepare_verified_receipt_direct_replay,
++            db_path=runner._session_db._db.db_path,
++            receipt_root=Path(os.getenv("HERMES_RESEARCH_RECEIPT_ROOT", str(home / "research-receipts"))),
++            marker_root=Path(os.getenv("HERMES_VERIFIED_RECEIPT_DIRECT_REPLAY_MARKER_ROOT", str(home / "verified-receipt-direct-replay-attempts"))),
++            session_id=session_id,
++            current_prompt=prompt,
++            current_response=response,
++            already_sent=bool(result.get("already_sent")),
++            failed=bool(result.get("failed")),
++        )
++    except FileExistsError:
++        logger.warning("Verified receipt recovery was already attempted for session %s", session_id)
++        return
++    except Exception as exc:
++        # An ineligible/ambiguous receipt keeps the original response. Recovery is
++        # deliberately narrower than the gateway's ordinary response path.
++        logger.warning("Verified receipt recovery ineligible for session %s: %s", session_id, exc)
++        return
++    if replay is not None:
++        result["final_response"] = replay.content
++        result["already_sent"] = False
++        result["verified_receipt_direct_replay"] = {
++            "assistant_message_id": replay.assistant_message_id,
++            "receipt_sha256": replay.receipt_sha256,
++            "attempt_marker_path": replay.attempt_marker_path,
++        }
++    return replay
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 23ea8ad6e..2f61e4e89 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -1213,6 +1213,9 @@ class GatewaySlashCommandsMixin(
+         import json
+         from gateway.run import _hermes_home, _resolve_hermes_bin
+         from hermes_cli.config import is_managed, format_managed_message
++        if not getattr(getattr(self, "config", None), "allow_update_command", True):
++            logger.warning("Gateway /update rejected because gateway.allow_update_command=false")
++            return t("gateway.update.disabled_by_config")
+         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
+         # allow_update_command=True are also allowed.
+         src = event.source
+diff --git a/gateway/verified_receipt_direct_replay.py b/gateway/verified_receipt_direct_replay.py
+new file mode 100644
+index 000000000..55d3fcbcd
+--- /dev/null
++++ b/gateway/verified_receipt_direct_replay.py
+@@ -0,0 +1,257 @@
++"""Fail-closed direct replay for a verified generic-research receipt.
++
++This module deliberately does not call a model or send a platform message.  It
++can only recover the exact assistant bytes already committed to the state DB for
++the current receipt-bound turn.  The gateway remains responsible for its normal
++single Telegram send.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import sqlite3
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++
++_URL_RE = re.compile(r"https://[^\s<>\]\[(){}\"']+")
++_EMPTY_RESPONSES = {"", "(empty)"}
++
++
++@dataclass(frozen=True)
++class DirectReplay:
++    content: str
++    assistant_message_id: int
++    receipt_path: str
++    receipt_sha256: str
++    attempt_marker_path: str
++    cited_urls: tuple[str, ...]
++
++
++def _sha256_bytes(value: bytes) -> str:
++    return hashlib.sha256(value).hexdigest()
++
++
++def _sha256_text(value: str) -> str:
++    return hashlib.sha256(value.encode("utf-8")).hexdigest()
++
++
++def _response_urls(value: str) -> set[str]:
++    return {match.rstrip(".,;:!?") for match in _URL_RE.findall(value)}
++
++
++def _read_receipt_once(path: Path) -> tuple[bytes, dict[str, Any]]:
++    if path.is_symlink() or not path.is_file():
++        raise ValueError("receipt is missing or is not a regular file")
++    raw = path.read_bytes()
++    try:
++        receipt = json.loads(raw)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("receipt is not valid UTF-8 JSON") from exc
++    if not isinstance(receipt, dict):
++        raise ValueError("receipt root is not an object")
++    return raw, receipt
++
++
++def _validate_receipt(
++    *,
++    receipt: dict[str, Any],
++    session_id: str,
++    user_message_id: int,
++    prompt: str,
++    minimum_sources: int,
++) -> tuple[str, set[str]]:
++    if receipt.get("kind") != "hermes-generic-research-receipt":
++        raise ValueError("receipt kind is not eligible")
++    if receipt.get("schema_version") != 1:
++        raise ValueError("receipt schema is not eligible")
++    if receipt.get("session_id") != session_id:
++        raise ValueError("receipt session does not match")
++    if receipt.get("turn_user_message_id") != user_message_id:
++        raise ValueError("receipt user message does not match")
++    prompt_sha256 = _sha256_text(prompt)
++    if receipt.get("turn_prompt_sha256") != prompt_sha256:
++        raise ValueError("receipt prompt digest does not match")
++    if receipt.get("controller_rejections") != []:
++        raise ValueError("receipt has controller rejections")
++    if receipt.get("production_promotion_authorized") is not False:
++        raise ValueError("receipt promotion flag is invalid")
++
++    sources = receipt.get("sources")
++    allowlist = receipt.get("final_citation_allowlist")
++    if not isinstance(sources, list) or len(sources) < minimum_sources:
++        raise ValueError("receipt has too few sources")
++    if not isinstance(allowlist, list) or len(allowlist) < minimum_sources:
++        raise ValueError("receipt has too few allowed citations")
++    source_urls: list[str] = []
++    for source in sources:
++        if not isinstance(source, dict):
++            raise ValueError("receipt source is not an object")
++        url = source.get("url")
++        content_sha256 = source.get("content_sha256")
++        if not isinstance(url, str) or not url.startswith("https://"):
++            raise ValueError("receipt source URL is not HTTPS")
++        if not isinstance(content_sha256, str) or not re.fullmatch(
++            r"[0-9a-f]{64}", content_sha256
++        ):
++            raise ValueError("receipt source digest is invalid")
++        source_urls.append(url)
++    if (
++        any(not isinstance(url, str) or not url.startswith("https://") for url in allowlist)
++        or len(set(allowlist)) != len(allowlist)
++        or set(source_urls) != set(allowlist)
++    ):
++        raise ValueError("receipt sources and citation allowlist do not match")
++    return prompt_sha256, set(allowlist)
++
++
++def _create_attempt_marker(
++    marker_root: Path,
++    *,
++    receipt_sha256: str,
++    session_id: str,
++    user_message_id: int,
++    assistant_message_id: int,
++    content_sha256: str,
++) -> Path:
++    marker_root.mkdir(mode=0o700, parents=True, exist_ok=True)
++    marker_path = marker_root / f"{receipt_sha256}.json"
++    payload = (
++        json.dumps(
++            {
++                "kind": "hermes-verified-receipt-direct-replay-attempt",
++                "schema_version": 1,
++                "session_id": session_id,
++                "turn_user_message_id": user_message_id,
++                "assistant_message_id": assistant_message_id,
++                "receipt_sha256": receipt_sha256,
++                "content_sha256": content_sha256,
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        + "\n"
++    ).encode("utf-8")
++    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
++    if hasattr(os, "O_NOFOLLOW"):
++        flags |= os.O_NOFOLLOW
++    descriptor = os.open(marker_path, flags, 0o600)
++    try:
++        with os.fdopen(descriptor, "wb", closefd=False) as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++    finally:
++        os.close(descriptor)
++    return marker_path
++
++
++def prepare_verified_receipt_direct_replay(
++    *,
++    db_path: Path,
++    receipt_root: Path,
++    marker_root: Path,
++    session_id: str,
++    current_prompt: str,
++    current_response: str,
++    already_sent: bool,
++    failed: bool,
++    minimum_sources: int = 2,
++    minimum_citations: int = 2,
++    minimum_content_chars: int = 500,
++) -> DirectReplay | None:
++    """Return exact verified assistant bytes once, otherwise fail closed.
++
++    Eligibility is intentionally narrow.  The current raw agent response must
++    be empty, no send may already be confirmed, and the latest active user row
++    must be the receipt's originating row.  Any ambiguity returns no replay or
++    raises before the one-attempt marker is committed.
++    """
++    if failed or already_sent or current_response not in _EMPTY_RESPONSES:
++        return None
++    if not session_id or not current_prompt:
++        return None
++
++    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as connection:
++        connection.row_factory = sqlite3.Row
++        user_row = connection.execute(
++            "SELECT id, content FROM messages WHERE session_id = ? "
++            "AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1",
++            (session_id,),
++        ).fetchone()
++        if user_row is None:
++            return None
++        user_message_id = int(user_row["id"])
++        stored_prompt = user_row["content"]
++        if not isinstance(stored_prompt, str) or stored_prompt != current_prompt:
++            return None
++
++        root = receipt_root.resolve(strict=True)
++        receipt_path = (root / f"{session_id}--turn-{user_message_id}.json").resolve()
++        try:
++            receipt_path.relative_to(root)
++        except ValueError as exc:
++            raise ValueError("receipt path escapes configured root") from exc
++        raw_receipt, receipt = _read_receipt_once(receipt_path)
++        receipt_sha256 = _sha256_bytes(raw_receipt)
++        _, allowed = _validate_receipt(
++            receipt=receipt,
++            session_id=session_id,
++            user_message_id=user_message_id,
++            prompt=stored_prompt,
++            minimum_sources=minimum_sources,
++        )
++
++        rows = connection.execute(
++            "SELECT id, content, finish_reason FROM messages WHERE session_id = ? "
++            "AND role = 'assistant' AND active = 1 AND id > ? ORDER BY id",
++            (session_id, user_message_id),
++        ).fetchall()
++
++    eligible: list[tuple[int, str, tuple[str, ...]]] = []
++    for row in rows:
++        finish_reason = str(row["finish_reason"] or "")
++        content = row["content"]
++        if "generic_research_verified" not in finish_reason:
++            continue
++        if not isinstance(content, str) or content != content.strip():
++            continue
++        if len(content) < minimum_content_chars:
++            continue
++        cited = _response_urls(content)
++        if cited - allowed or len(cited & allowed) < minimum_citations:
++            continue
++        eligible.append((int(row["id"]), content, tuple(sorted(cited))))
++
++    if not eligible:
++        return None
++    if len(eligible) != 1:
++        raise ValueError("current receipt turn has multiple verified final answers")
++
++    # Re-read the receipt immediately before committing the attempt.  This is
++    # the seal check: any byte-level mutation between validation and replay
++    # makes the operation ineligible.
++    if _sha256_bytes(receipt_path.read_bytes()) != receipt_sha256:
++        raise ValueError("receipt changed during validation")
++
++    assistant_message_id, content, cited_urls = eligible[0]
++    marker_path = _create_attempt_marker(
++        marker_root,
++        receipt_sha256=receipt_sha256,
++        session_id=session_id,
++        user_message_id=user_message_id,
++        assistant_message_id=assistant_message_id,
++        content_sha256=_sha256_text(content),
++    )
++    return DirectReplay(
++        content=content,
++        assistant_message_id=assistant_message_id,
++        receipt_path=str(receipt_path),
++        receipt_sha256=receipt_sha256,
++        attempt_marker_path=str(marker_path),
++        cited_urls=cited_urls,
++    )
+diff --git a/locales/en.yaml b/locales/en.yaml
+index f8548e9dd..15e9bf87f 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -396,6 +396,7 @@ gateway:
+     invalid_count:         "Invalid count \"{arg}\" — use /undo or /undo N."
+ 
+   update:
++    disabled_by_config:      "✗ Gateway updates are disabled by configuration. Use the operator-managed upgrade workflow."
+     platform_not_messaging:  "✗ /update is only available from messaging platforms. Run `hermes update` from the terminal."
+     not_git_repo:            "✗ Not a git repository — cannot update."
+     hermes_cmd_not_found:    "✗ Could not locate the `hermes` command. Hermes is running, but the update command could not find the executable on PATH or via the current Python interpreter. Try running `hermes update` manually in your terminal."
+diff --git a/tests/agent/test_b70_retrieval_guardrails.py b/tests/agent/test_b70_retrieval_guardrails.py
+new file mode 100644
+index 000000000..44ddbc6f1
+--- /dev/null
++++ b/tests/agent/test_b70_retrieval_guardrails.py
+@@ -0,0 +1,128 @@
++"""Existing B70 behavior contracts retained verbatim during migration."""
++from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
++
++
++def test_concurrent_retrieval_admission_cannot_overspend_shared_budget():
++    from concurrent.futures import ThreadPoolExecutor
++    from threading import Barrier
++
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(retrieval_call_limit=3)
++    )
++    barrier = Barrier(16)
++
++    def submit(index):
++        barrier.wait(timeout=10)
++        tool = "web_search" if index % 2 else "web_extract"
++        return controller.before_call(tool, {"query": str(index)})
++
++    with ThreadPoolExecutor(max_workers=16) as pool:
++        decisions = list(pool.map(submit, range(16)))
++    assert sum(d.allows_execution for d in decisions) == 3
++    assert sum(d.action == "skip" for d in decisions) == 13
++    assert not any(d.should_halt for d in decisions)
++    controller.reset_for_turn()
++    assert controller.before_call("web_search", {"query": "new turn"}).allows_execution
++
++def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
++    cfg = ToolCallGuardrailConfig()
++
++    assert cfg.warnings_enabled is True
++    assert cfg.hard_stop_enabled is False
++    assert cfg.exact_failure_warn_after == 2
++    assert cfg.same_tool_failure_warn_after == 3
++    assert cfg.no_progress_warn_after == 2
++    assert cfg.exact_failure_block_after == 5
++    assert cfg.same_tool_failure_halt_after == 8
++    assert cfg.no_progress_block_after == 5
++    assert cfg.retrieval_call_limit == 0
++
++def test_config_parses_nested_warn_and_hard_stop_thresholds():
++    cfg = ToolCallGuardrailConfig.from_mapping(
++        {
++            "warnings_enabled": False,
++            "hard_stop_enabled": True,
++            "warn_after": {
++                "exact_failure": 3,
++                "same_tool_failure": 4,
++                "idempotent_no_progress": 5,
++            },
++            "hard_stop_after": {
++                "exact_failure": 6,
++                "same_tool_failure": 7,
++                "idempotent_no_progress": 8,
++            },
++            "retrieval_call_limit": 9,
++        }
++    )
++
++    assert cfg.warnings_enabled is False
++    assert cfg.hard_stop_enabled is True
++    assert cfg.exact_failure_warn_after == 3
++    assert cfg.same_tool_failure_warn_after == 4
++    assert cfg.no_progress_warn_after == 5
++    assert cfg.exact_failure_block_after == 6
++    assert cfg.same_tool_failure_halt_after == 7
++    assert cfg.no_progress_block_after == 8
++    assert cfg.retrieval_call_limit == 9
++
++def test_optional_retrieval_limit_skips_network_call_without_halting_turn():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(retrieval_call_limit=2)
++    )
++
++    first = controller.before_call("web_search", {"query": "one"})
++    second = controller.before_call("web_extract", {"urls": ["https://example.test"]})
++    skipped = controller.before_call("web_search", {"query": "three"})
++
++    assert first.action == "allow"
++    assert second.action == "allow"
++    assert skipped.action == "skip"
++    assert skipped.code == "retrieval_call_limit_reached"
++    assert skipped.count == 2
++    assert skipped.allows_execution is False
++    assert skipped.should_halt is False
++    assert "Synthesize the best answer now" in skipped.message
++    assert controller.halt_decision is None
++
++def test_retrieval_limit_ignores_local_reads_and_resets_per_turn():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(retrieval_call_limit=1)
++    )
++
++    assert controller.before_call("read_file", {"path": "/tmp/a"}).action == "allow"
++    assert controller.before_call("web_search", {"query": "one"}).action == "allow"
++    assert controller.before_call("web_extract", {"urls": ["https://example.test"]}).action == "skip"
++
++    controller.reset_for_turn()
++
++    assert controller.before_call("web_extract", {"urls": ["https://example.test"]}).action == "allow"
++
++def test_terminal_web_provider_402_warns_immediately_and_allows_synthesis():
++    controller = ToolCallGuardrailController()
++
++    decision = controller.after_call(
++        "web_search",
++        {"query": "current Toronto train schedule"},
++        '{"error":"Brave returned HTTP 402 Payment Required"}',
++        failed=True,
++    )
++
++    assert decision.action == "warn"
++    assert decision.code == "terminal_provider_failure_warning"
++    assert decision.count == 1
++    assert "Do not retry this provider path" in decision.message
++    assert "synthesize the answer now" in decision.message
++    assert "keep using tools" not in decision.message
++
++def test_terminal_provider_status_code_shape_is_recognized_for_web_extract():
++    controller = ToolCallGuardrailController()
++
++    decision = controller.after_call(
++        "web_extract",
++        {"url": "https://example.test"},
++        '{"success":false,"status_code":402,"error":"quota"}',
++        failed=True,
++    )
++
++    assert decision.code == "terminal_provider_failure_warning"
+diff --git a/tests/agent/test_tool_call_guardrail_runtime.py b/tests/agent/test_tool_call_guardrail_runtime.py
+index a88cfcdf4..a22e84f1e 100644
+--- a/tests/agent/test_tool_call_guardrail_runtime.py
++++ b/tests/agent/test_tool_call_guardrail_runtime.py
+@@ -94,6 +94,33 @@ def _hard_stop_config(**overrides) -> dict:
+     return cfg
+ 
+ 
++@pytest.mark.parametrize("execution", ["sequential", "concurrent"])
++def test_retrieval_budget_skips_network_but_preserves_local_reads_and_synthesis(execution):
++    agent = _make_agent(
++        "web_search", "web_extract", "read_file",
++        config={"tool_loop_guardrails": {"retrieval_call_limit": 1}},
++    )
++    # Seed the budget through the actual dispatch path, then offer another
++    # retrieval alongside a local read in either executor.
++    messages = []
++    initial = SimpleNamespace(content="", tool_calls=[
++        _mock_tool_call("web_search", '{"query":"one"}', "first")
++    ])
++    followup = SimpleNamespace(content="", tool_calls=[
++        _mock_tool_call("web_extract", '{"url":"https://example.test"}', "skipped"),
++        _mock_tool_call("read_file", '{"path":"/tmp/captured.txt"}', "local"),
++    ])
++    with patch("model_tools.handle_function_call", return_value='{"content":"captured fact"}') as dispatch:
++        agent._execute_tool_calls_sequential(initial, messages, "budget-task")
++        getattr(agent, f"_execute_tool_calls_{execution}")(followup, messages, "budget-task")
++    assert [call.args[0] for call in dispatch.call_args_list] == ["web_search", "read_file"]
++    assert [message["tool_call_id"] for message in messages] == ["first", "skipped", "local"]
++    assert "retrieval_call_limit_reached" in messages[1]["content"]
++    assert "Synthesize the best answer now" in messages[1]["content"]
++    assert json.loads(messages[2]["content"])["content"] == "captured fact"
++    assert agent._tool_guardrail_halt_decision is None
++
++
+ def test_gateway_platform_uses_hard_stop_default_without_cli_opt_in():
+     agent = _make_agent("web_search", platform="telegram")
+     args = {"query": "same"}
+diff --git a/tests/agent/transports/test_chat_completions.py b/tests/agent/transports/test_chat_completions.py
+index 4a4541d0e..f0a89a6b8 100644
+--- a/tests/agent/transports/test_chat_completions.py
++++ b/tests/agent/transports/test_chat_completions.py
+@@ -1036,3 +1036,80 @@ class TestPromptCacheKeyCapability:
+             request_overrides={"prompt_cache_key": "   "},
+         )
+         assert "prompt_cache_key" not in kwargs
++
++
++class TestB70PrivateMarkers:
++    def test_convert_messages_strips_opaque_nested_tool_call_markers(self, transport):
++        """Private lifecycle authority stays in memory but never reaches JSON.
++
++        Parallel research authenticates an assistant tool call and its result
++        with the same bare ``object()`` token. A mock client accepts that
++        value, while the real OpenAI SDK must JSON-encode the second request
++        and otherwise fails before any provider POST is made.
++        """
++        auth_token = object()
++        msgs = [
++            {
++                "role": "assistant",
++                "content": "",
++                "tool_calls": [
++                    {
++                        "id": "call-skill",
++                        "type": "function",
++                        "function": {
++                            "name": "skill_view",
++                            "arguments": '{"name":"parallel-research"}',
++                        },
++                        "_research_lifecycle_auth_token": auth_token,
++                    }
++                ],
++            },
++            {
++                "role": "tool",
++                "tool_call_id": "call-skill",
++                "content": '{"success":true}',
++                "_research_lifecycle_auth_token": auth_token,
++            },
++        ]
++
++        result = transport.convert_messages(msgs)
++
++        assert "_research_lifecycle_auth_token" not in result[0]["tool_calls"][0]
++        assert "_research_lifecycle_auth_token" not in result[1]
++        json.dumps(result)
++        assert (
++            msgs[0]["tool_calls"][0]["_research_lifecycle_auth_token"]
++            is auth_token
++        )
++        assert msgs[1]["_research_lifecycle_auth_token"] is auth_token
++
++    def test_nested_private_marker_strip_preserves_gemini_signature(self, transport):
++        """Wire privacy and Gemini's required replay metadata compose safely."""
++        auth_token = object()
++        signature = {"google": {"thought_signature": "SIG_123"}}
++        msgs = [
++            {
++                "role": "assistant",
++                "content": "",
++                "tool_calls": [
++                    {
++                        "id": "call-skill",
++                        "type": "function",
++                        "function": {"name": "skill_view", "arguments": "{}"},
++                        "extra_content": signature,
++                        "_research_lifecycle_auth_token": auth_token,
++                    }
++                ],
++            }
++        ]
++
++        result = transport.convert_messages(msgs, model="google/gemini-3-pro")
++
++        wire_call = result[0]["tool_calls"][0]
++        assert "_research_lifecycle_auth_token" not in wire_call
++        assert wire_call["extra_content"] == signature
++        json.dumps(result)
++        assert (
++            msgs[0]["tool_calls"][0]["_research_lifecycle_auth_token"]
++            is auth_token
++        )
+diff --git a/tests/gateway/test_config.py b/tests/gateway/test_config.py
+index 32923a9a2..d7843f25f 100644
+--- a/tests/gateway/test_config.py
++++ b/tests/gateway/test_config.py
+@@ -1376,3 +1376,23 @@ class TestWebhookEnvOverride:
+             config.platforms[Platform.WEBHOOK].extra.get("secret")
+             == "shared-secret"
+         )
++
++
++class TestB70GatewayConfig:
++    def test_update_command_policy_from_nested_gateway_section(
++        self, tmp_path, monkeypatch
++    ):
++        """The user-facing nested gateway setting must reach runtime config."""
++        hermes_home = tmp_path / ".hermes"
++        hermes_home.mkdir()
++        config_path = hermes_home / "config.yaml"
++        config_path.write_text(
++            "gateway:\n  allow_update_command: false\n",
++            encoding="utf-8",
++        )
++
++        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++        config = load_gateway_config()
++
++        assert config.allow_update_command is False
+diff --git a/tests/gateway/test_gateway_silence_tokens.py b/tests/gateway/test_gateway_silence_tokens.py
+index a9f7ce445..a5b83821f 100644
+--- a/tests/gateway/test_gateway_silence_tokens.py
++++ b/tests/gateway/test_gateway_silence_tokens.py
+@@ -1,6 +1,9 @@
+ """Gateway intentional-silence token behavior."""
+ 
+ from datetime import datetime
++import hashlib
++import json
++import sqlite3
+ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+@@ -76,6 +79,113 @@ def _runner(monkeypatch, tmp_path):
+     return runner
+ 
+ 
++@pytest.fixture
++def verified_receipt(monkeypatch, tmp_path):
++    """Use the release's real SQLite schema, with no private conversation copy."""
++    from hermes_state import SessionDB
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_VERIFIED_RECEIPT_DIRECT_REPLAY_CANARY", "1")
++    monkeypatch.delenv("HERMES_RESEARCH_RECEIPT_ROOT", raising=False)
++    monkeypatch.delenv("HERMES_VERIFIED_RECEIPT_DIRECT_REPLAY_MARKER_ROOT", raising=False)
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("sess-silent", "telegram")
++    user_id = db.append_message("sess-silent", "user", "side chatter")
++    urls = ["https://example.test/source-a", "https://example.test/source-b"]
++    answer = ("Captured sources retain their dates, units and conditions. " * 10
++              + f"[First]({urls[0]}) and [second]({urls[1]}).")
++    db.append_message("sess-silent", "assistant", answer,
++                      finish_reason="generic_research_verified")
++    receipt = {
++        "kind": "hermes-generic-research-receipt", "schema_version": 1,
++        "session_id": "sess-silent", "turn_user_message_id": user_id,
++        "turn_prompt_sha256": hashlib.sha256(b"side chatter").hexdigest(),
++        "controller_rejections": [], "production_promotion_authorized": False,
++        "sources": [{"url": url, "content_sha256": hashlib.sha256(url.encode()).hexdigest()}
++                    for url in urls],
++        "final_citation_allowlist": urls,
++    }
++    root = tmp_path / "research-receipts"
++    root.mkdir()
++    receipt_path = root / f"sess-silent--turn-{user_id}.json"
++    receipt_path.write_text(json.dumps(receipt))
++    try:
++        yield db, answer, receipt_path
++    finally:
++        db.close()
++
++
++@pytest.mark.asyncio
++async def test_receipt_recovery_uses_real_gateway_and_release_db_once(monkeypatch, tmp_path, verified_receipt):
++    db, answer, _ = verified_receipt
++    runner = _runner(monkeypatch, tmp_path)
++    runner._session_db._db = db
++    runner._hmwa_prepend_reasoning = MagicMock(side_effect=AssertionError("receipt changed"))
++    runner._hmwa_runtime_footer_line = MagicMock(side_effect=AssertionError("receipt changed"))
++    result = {"final_response": "", "messages": [], "tools": [],
++              "history_offset": 0, "last_prompt_tokens": 0, "api_calls": 1, "failed": False}
++    runner._run_agent = AsyncMock(return_value=result)
++    response = await runner._handle_message_with_agent(
++        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1)
++    assert response == answer
++    assert result["verified_receipt_direct_replay"]["assistant_message_id"] > 0
++    markers = list((tmp_path / "verified-receipt-direct-replay-attempts").glob("*.json"))
++    assert len(markers) == 1
++    with sqlite3.connect(db.db_path) as connection:
++        assert connection.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
++    # A new runner after a restart must still respect the on-disk marker.
++    # The outer delivery wrapper owns the first runner's turn lease.
++    runner = _runner(monkeypatch, tmp_path)
++    runner._session_db._db = db
++    duplicate = {key: value for key, value in result.items()
++                 if key != "verified_receipt_direct_replay"}
++    duplicate["final_response"] = ""
++    runner._run_agent = AsyncMock(return_value=duplicate)
++    response = await runner._handle_message_with_agent(
++        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1)
++    assert response != answer
++    assert len(list(markers[0].parent.glob("*.json"))) == 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("case", ["disabled", "failed", "sent", "silence", "answer", "rotated", "wrong_prompt", "rejected", "ambiguous", "stale"])
++async def test_receipt_recovery_declines_ineligible_gateway_turns(monkeypatch, tmp_path, verified_receipt, case):
++    db, answer, receipt_path = verified_receipt
++    runner = _runner(monkeypatch, tmp_path)
++    runner._session_db._db = db
++    result = {"final_response": "", "messages": [], "tools": [],
++              "history_offset": 0, "last_prompt_tokens": 0, "api_calls": 1, "failed": False}
++    if case == "disabled":
++        monkeypatch.setenv("HERMES_VERIFIED_RECEIPT_DIRECT_REPLAY_CANARY", "0")
++    elif case == "failed":
++        result["failed"] = True
++    elif case == "sent":
++        result["already_sent"] = True
++    elif case == "silence":
++        result["final_response"] = "[SILENT]"
++    elif case == "answer":
++        result["final_response"] = "Existing answer."
++    elif case == "rotated":
++        result["session_id"] = "another-session"
++    elif case == "wrong_prompt":
++        db.append_message("sess-silent", "user", "newer question")
++    elif case == "rejected":
++        receipt = json.loads(receipt_path.read_text())
++        receipt["controller_rejections"] = ["missing evidence"]
++        receipt_path.write_text(json.dumps(receipt))
++    elif case == "ambiguous":
++        db.append_message("sess-silent", "assistant", answer,
++                          finish_reason="generic_research_verified")
++    elif case == "stale":
++        runner._is_session_run_current = lambda *_: False
++    runner._run_agent = AsyncMock(return_value=result)
++    response = await runner._handle_message_with_agent(
++        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1)
++    assert response != answer
++    assert "verified_receipt_direct_replay" not in result
++    assert not (tmp_path / "verified-receipt-direct-replay-attempts").exists()
++
++
+ def test_exact_silence_tokens_are_intentional_silence():
+     for token in ("[SILENT]", " SILENT ", "NO_REPLY", "no reply"):
+         assert is_intentional_silence_response(token)
+diff --git a/tests/gateway/test_update_command.py b/tests/gateway/test_update_command.py
+index 58898b932..a489a9d2f 100644
+--- a/tests/gateway/test_update_command.py
++++ b/tests/gateway/test_update_command.py
+@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
+ 
+ import pytest
+ 
+-from gateway.config import Platform
++from gateway.config import GatewayConfig, Platform
+ from gateway.platforms.event import MessageEvent
+ from gateway.session import SessionSource
+ 
+@@ -544,3 +544,35 @@ class TestWatchUpdateProgress:
+         assert "continued after" in sent
+         assert "Hermes update finished" in sent
+         assert not (hermes_home / ".update_pending.json").exists()
++
++
++class TestB70GatewayUpdatePolicy:
++    @pytest.mark.asyncio
++    async def test_configured_denial_has_zero_update_side_effects(self, tmp_path):
++        """A hardened gateway rejects before markers or process creation."""
++        runner = _make_runner()
++        runner.config = GatewayConfig(allow_update_command=False)
++        event = _make_event()
++        existing_output = tmp_path / ".update_output.txt"
++        existing_output.write_bytes(b"preserve-existing-output")
++
++        with patch("gateway.run._hermes_home", tmp_path), \
++             patch("subprocess.Popen") as mock_popen, \
++             patch("shutil.which") as mock_which:
++            result = await runner._handle_update_command(event)
++
++        assert "disabled by configuration" in result
++        mock_popen.assert_not_called()
++        mock_which.assert_not_called()
++        assert not (tmp_path / ".update_pending.json").exists()
++        assert not (tmp_path / ".update_pending.tmp").exists()
++        assert not (tmp_path / ".update_exit_code").exists()
++        assert existing_output.read_bytes() == b"preserve-existing-output"
++
++    def test_gateway_update_policy_round_trips(self):
++        denied = GatewayConfig.from_dict({"allow_update_command": False})
++        assert denied.allow_update_command is False
++        assert denied.to_dict()["allow_update_command"] is False
++
++        default = GatewayConfig.from_dict({})
++        assert default.allow_update_command is True
+diff --git a/tests/tools/test_terminal_foreground_timeout_cap.py b/tests/tools/test_terminal_foreground_timeout_cap.py
+index b43c4941b..a0d61e4f3 100644
+--- a/tests/tools/test_terminal_foreground_timeout_cap.py
++++ b/tests/tools/test_terminal_foreground_timeout_cap.py
+@@ -5,6 +5,7 @@ process with notify_on_complete (never refused: in one 1,393-agent run 454 refus
+ re-sent lower/split/background, 251 of them test suites).
+ """
+ import json
++import pytest
+ from unittest.mock import patch, MagicMock
+ 
+ 
+@@ -193,3 +194,75 @@ class TestPromotionKeepsTheDetachmentGuard:
+         dropped = json.loads(_with_promoted_note(json.dumps({"session_id": "proc_x", "error": None, "notify_on_complete": False}), 900))
+         assert "cannot receive completion notifications" in dropped["promoted_from_foreground"]
+         assert "poll" in dropped["promoted_from_foreground"]
++
++
++@pytest.mark.parametrize("shape", ["controller", "runner"])
++def test_trusted_research_controller_keeps_900_second_foreground_lane(monkeypatch, tmp_path, shape):
++    from tools.terminal_tool import terminal_tool
++
++    home = tmp_path / "hermes"
++    vault = tmp_path / "vault"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
++    script = home / "skills/travel-planning/scripts/run_hermes_travel_pipeline.py"
++    raw = vault / "raw/travel"
++    command = (f"python3 {script} {raw}/manifest.json {raw}/run --timeout 600"
++               if shape == "controller" else
++               f"python3 -m agent.research_harness.travel_runner {raw}/request.json")
++    environment = MagicMock()
++    environment.execute.return_value = {"output": "controller completed", "returncode": 0}
++    with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
++         patch("tools.terminal_tool._start_cleanup_thread"), \
++         patch("tools.terminal_tool._active_environments", {"default": environment}), \
++         patch("tools.terminal_tool._last_activity", {"default": 0}), \
++         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
++        result = json.loads(terminal_tool(command=command, timeout=900))
++    assert result.get("error") is None
++    assert "promoted_from_foreground" not in result
++    assert environment.execute.call_args.kwargs["timeout"] == 900
++
++
++@pytest.mark.parametrize("case", ["lookalike", "outside", "escape", "symlink", "prepare", "option", "too_long", "no_vault"])
++def test_untrusted_controller_shapes_keep_upstream_background_plan(monkeypatch, tmp_path, case):
++    from tools.terminal_tool import _plan_execution
++
++    home, vault = tmp_path / "hermes", tmp_path / "vault"
++    raw = vault / "raw/travel"
++    raw.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
++    script = home / "skills/travel-planning/scripts/run_hermes_travel_pipeline.py"
++    manifest, run = raw / "manifest.json", raw / "run"
++    options, timeout = "", 900
++    if case == "lookalike":
++        script = tmp_path / script.name
++    elif case == "outside":
++        manifest = tmp_path / "manifest.json"
++    elif case == "escape":
++        manifest = raw / "../manifest.json"
++    elif case == "symlink":
++        manifest.symlink_to(tmp_path / "outside.json")
++    elif case == "prepare":
++        options = "--prepare-only"
++    elif case == "option":
++        options = "--timeout 601"
++    elif case == "too_long":
++        timeout = 901
++    elif case == "no_vault":
++        monkeypatch.delenv("OBSIDIAN_VAULT_PATH")
++    with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()):
++        plan = _plan_execution(f"python3 {script} {manifest} {run} {options}",
++                               task_id=None, timeout=timeout, background=False, _host_local=False)
++    assert plan.promoted_from_foreground_timeout == timeout
++
++
++def test_controller_name_cannot_bypass_canonical_publisher_guard(monkeypatch):
++    from tools.terminal_tool import _check_all_guards
++
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", "/vault")
++    with patch("tools.terminal_tool._check_all_guards_impl") as ordinary_guard:
++        result = _check_all_guards(
++            "python3 -m agent.research_harness.travel_runner /vault/travel/destinations/topic.md", "local")
++    assert result["approved"] is False
++    assert "canonical travel" in result["message"]
++    ordinary_guard.assert_not_called()
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index 46ceeb586..ab25bbd19 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -146,6 +146,11 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
+ def _check_all_guards(command: str, env_type: str,
+                       has_host_access: bool = False) -> dict:
+     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
++    from agent.travel_terminal_policy import canonical_travel_terminal_block
++
++    travel_block = canonical_travel_terminal_block(command)
++    if travel_block:
++        return {"approved": False, "description": "canonical travel path guard", "message": travel_block}
+     return _check_all_guards_impl(command, env_type,
+                                   approval_callback=_get_approval_callback(),
+                                   has_host_access=has_host_access)
+@@ -979,7 +984,10 @@ def _plan_execution(
+         if guidance:
+             raise _Rejected(_error_json(guidance, status="error"))
+         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+-            promoted = timeout
++            from agent.travel_terminal_policy import travel_controller_foreground_timeout_allowed
++
++            if not travel_controller_foreground_timeout_allowed(command, timeout):
++                promoted = timeout
+ 
+     return _ExecPlan(
+         config=config, env_type=env_type, effective_task_id=effective_task_id,

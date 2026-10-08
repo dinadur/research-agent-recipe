@@ -1,0 +1,23 @@
+[Unit]
+Description=Judge adapter on 127.0.0.1:8244 (Granite-style judge requests -> Clef-Flash systemone)
+After=llm-judge-clef.service
+Wants=llm-judge-clef.service
+PartOf=llm-judge-clef.service
+
+[Service]
+User=llm
+Group=llm
+Environment=CLEF_THRESHOLD=0.85
+Environment=CLEF_ALIAS=guardian
+Environment=CLEF_DECISION_LOG=/var/log/research-agent/judge-decisions.jsonl
+ExecStart=/usr/bin/python3 -u /opt/research-agent/adapters/clef_groundedness_adapter.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/research-agent
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

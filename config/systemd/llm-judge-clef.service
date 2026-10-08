@@ -1,0 +1,20 @@
+# Judge lane engine: Clef-Flash Q4_K_M on llama.cpp (SYCL build), serving /v1/systemone on 127.0.0.1:8297.
+# -b/-ub 1024 is the server batch: a single judge request (criterion + excerpts) must fit in it, or llama-server
+# answers "input too large". Raising it to 2048 costs VRAM; measure before changing.
+[Unit]
+Description=Judge lane engine (Clef-Flash Q4_K_M, llama.cpp)
+After=network-online.target
+
+[Service]
+User=llm
+Group=llm
+Environment=HOME=/var/lib/llm
+ExecStart=/bin/bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; \
+  export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 ZE_AFFINITY_MASK=1 ONEAPI_DEVICE_SELECTOR=level_zero:0; \
+  exec /opt/llama.cpp/bin/llama-server -m /srv/models/clef-flash/clef-flash-Q4_K_M.gguf -a clef-flash \
+  --host 127.0.0.1 --port 8297 -ngl 99 -dev SYCL0 -c 2048 -np 1 -b 1024 -ub 1024'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

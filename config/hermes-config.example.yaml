@@ -1,0 +1,15 @@
+# Snippet for the Hermes config (merge into your existing config; no keys needed for a loopback judge).
+# product_research.groundedness_judge drives both:
+#  - the strict product gate (used when HERMES_PRODUCT_RESEARCH_QUALITY_FIRST is off): fails closed and withholds
+#    the answer if the judge is unavailable;
+#  - the log-only shadow check of quality-first answers (HERMES_PRODUCT_GROUNDEDNESS_SHADOW=1), which never
+#    changes, delays or withholds an answer.
+product_research:
+  groundedness_judge:
+    enabled: true
+    base_url: http://127.0.0.1:8244/v1   # the Clef adapter (or a relay in front of it)
+    model: guardian                      # must match CLEF_ALIAS
+    timeout: 30                          # seconds, clamped to 1-120
+    max_retries: 1                       # strict gate only, clamped to 0-2
+    max_claims: 12                       # strict gate only, clamped to 1-20
+    # api_key: not needed for a loopback adapter (defaults to "local-judge")

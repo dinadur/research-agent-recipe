@@ -1,0 +1,51 @@
+From 9810b5bacce0561039cd8945fbb2b51c89ae404b Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:52:03 +0000
+Subject: [PATCH 14/18] B70: shadow claim filter catches labelled
+ recommendation lines
+
+The 20:48 live run judged 'Recommended if under $500: ...', 'Alternative:
+...' and 'Price must be verified ...' as facts: the label alternatives were
+followed by a word boundary that never matches after a colon. Labels now
+match with up to 40 chars before the colon, and 'must be' joins 'should be'.
+Graded-set filter result unchanged (25/26 facts kept).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_groundedness.py            | 6 +++---
+ tests/agent/test_product_groundedness.py | 8 ++++++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/agent/product_groundedness.py b/agent/product_groundedness.py
+index cc32cb1c4..f7f960a52 100644
+--- a/agent/product_groundedness.py
++++ b/agent/product_groundedness.py
+@@ -479,9 +479,9 @@ _META_RE = re.compile(
+     re.IGNORECASE,
+ )
+ _ADVICE_RE = re.compile(
+-    r"^(?:buy|choose|accept|consider|pick|get|skip|avoid|use|treat|verify|check|expect|"
+-    r"if|alternative\s*:|recommended(?: candidate| model)?\s*:)\b|"
+-    r"\b(?:you|your|you're|you'd|you'll)\b|\bnot recommended\b|\bshould be\b",
++    r"^(?:(?:buy|choose|accept|consider|pick|get|skip|avoid|use|treat|verify|check|expect|if)\b|"
++    r"(?:recommended|alternative|best pick|runner-up|verdict)\b[^.:]{0,40}:)|"
++    r"\b(?:you|your|you're|you'd|you'll)\b|\bnot recommended\b|\b(?:should|must) be\b",
+     re.IGNORECASE,
+ )
+ 
+diff --git a/tests/agent/test_product_groundedness.py b/tests/agent/test_product_groundedness.py
+index 91be91b5a..ba14a2136 100644
+--- a/tests/agent/test_product_groundedness.py
++++ b/tests/agent/test_product_groundedness.py
+@@ -457,3 +457,11 @@ def test_shadow_evidence_covers_separate_facts_and_units():
+ def test_shadow_evidence_falls_back_to_page_start_when_nothing_matches():
+     ev = product_groundedness.shadow_select_evidence("Zebra quantum flux", ["u"], {"u": "alpha beta gamma " * 200})
+     assert len(ev) == 1 and ev[0]["quote"].startswith("alpha")
++
++
++def test_shadow_claim_kind_catches_labelled_recommendation_lines():
++    kind = product_groundedness.shadow_claim_kind
++    assert kind("Recommended if under $500: iRobot Roomba Combo j5+ — best available pet-home workflow evidence") == "advice"
++    assert kind("Alternative: Roborock Q7 Max+ — good official mopping and self-empty specs") == "advice"
++    assert kind("Price must be verified as a current offer") == "advice"
++    assert kind("The official page lists 4,200 Pa suction and an Auto-Empty Dock") == "fact"

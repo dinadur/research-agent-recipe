@@ -1,0 +1,361 @@
+From 3faa1ccbc461187ce5f21d29a162d0b7d1e1d17b Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:43:55 +0000
+Subject: [PATCH 09/18] B70: product comparisons by 'comparing' + one repair
+ fetch before withholding
+
+extract_targets only recognised 'compare X, Y and Z for/on' and 'research X
+for', and used only the first matching clause. 'Research the best X under $N
+for Y, comparing A, B and C' therefore yielded no alternatives, so named
+three-product comparisons took the single-candidate path (and its
+candidate_budget_missing rule). Add the 'comparing' clause and use the first
+clause that names 2-8 alternatives.
+
+With HERMES_PRODUCT_RESEARCH_REPAIR_FETCH=1, an unready receipt request after
+the 4-search / 2-extract budget is spent no longer withholds at once: the
+controller grants exactly one more web_search and web_extract for the turn
+and names the missing evidence. A second unready receipt request withholds as
+before.
+
+Replay of the seven product turns withheld on 2026-10-07 against the receipt
+viability gate: the parser fix alone makes 1 ready; the rest lacked two
+independent source families with the budget already spent, which the repair
+fetch addresses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   |  96 ++++++++++++++++-
+ agent/quality_first_route.py             |  25 +++--
+ tests/agent/test_product_repair_fetch.py | 130 +++++++++++++++++++++++
+ 3 files changed, 237 insertions(+), 14 deletions(-)
+ create mode 100644 tests/agent/test_product_repair_fetch.py
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index f5e344c00..e67c02c44 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -49,6 +49,9 @@ PRODUCT_RESEARCH_RECOVERY_MAX_URLS = 3
+ PRODUCT_RESEARCH_SOURCE_MIX_NUDGE_LIMIT = 2
+ PRODUCT_RESEARCH_FINALIZATION_NUDGE_LIMIT = 3
+ PRODUCT_RESEARCH_DURABLE_FINALIZATION_NUDGE_LIMIT = 1
++# One controller-granted repair search plus extraction when the receipt is
++# requested with an unready packet after the bounded budget is spent.
++PRODUCT_RESEARCH_REPAIR_FETCH_ENV = "HERMES_PRODUCT_RESEARCH_REPAIR_FETCH"
+ PRODUCT_RESEARCH_EVIDENCE_ROWS_PER_SOURCE = 6
+ PRODUCT_RESEARCH_DURABLE_EVIDENCE_ROWS_PER_SOURCE = 4
+ PRODUCT_RESEARCH_MIN_EVIDENCE_ROWS = 12
+@@ -586,6 +589,20 @@ def _product_research_quality_first_environment_enabled() -> bool:
+     return os.environ.get(PRODUCT_RESEARCH_QUALITY_FIRST_ENV, "").strip() == "1"
+ 
+ 
++def _product_research_repair_fetch_enabled() -> bool:
++    return os.environ.get(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "").strip() == "1"
++
++
++def _product_research_repair_bonus(agent: Any) -> int:
++    """Extra search/extract calls granted to the current turn (0 or 1)."""
++
++    turn_id = getattr(agent, "_current_turn_id", None)
++    return int(
++        bool(turn_id)
++        and getattr(agent, "_product_research_repair_grant_turn_id", None) == turn_id
++    )
++
++
+ def _product_research_durable_comparison_mode(original_request: Any) -> bool:
+     """Classify a neutral exact-product comparison from clean operator prose."""
+ 
+@@ -941,9 +958,10 @@ def constrain_product_research_tool_calls(
+         observed["web_extract"],
+     )
+ 
++    repair_bonus = _product_research_repair_bonus(agent)
+     limits = {
+-        "web_search": PRODUCT_RESEARCH_MAX_SEARCH_CALLS,
+-        "web_extract": PRODUCT_RESEARCH_MAX_EXTRACT_CALLS,
++        "web_search": PRODUCT_RESEARCH_MAX_SEARCH_CALLS + repair_bonus,
++        "web_extract": PRODUCT_RESEARCH_MAX_EXTRACT_CALLS + repair_bonus,
+     }
+     remaining = {name: max(0, limit - observed[name]) for name, limit in limits.items()}
+     retained: list[Any] = []
+@@ -2048,6 +2066,45 @@ def _product_viability_nudge(reasons: tuple[str, ...]) -> str:
+     )
+ 
+ 
++_REPAIR_REASON_TEXT = {
++    "independent_candidate_evidence_too_thin": (
++        "independent hands-on reviews or comparisons from at least two different "
++        "publishers (not the manufacturers or retailers)"
++    ),
++    "candidate_budget_missing": (
++        "a page whose text shows a current price within the budget for the "
++        "recommended model (for example a retailer product page)"
++    ),
++    "quality_first_target_evidence_missing": (
++        "an extracted page for every alternative the operator named"
++    ),
++    "official_product_evidence_missing": (
++        "the official manufacturer product page for the recommended model"
++    ),
++    "durable_official_model_evidence_missing": (
++        "the official manufacturer page for every exact model named"
++    ),
++    "source_mix_incomplete": "at least three successful sources from three sites",
++}
++
++
++def _product_repair_fetch_nudge(reasons: Any) -> str:
++    missing = [
++        _REPAIR_REASON_TEXT[reason]
++        for reason in reasons
++        if isinstance(reason, str) and reason in _REPAIR_REASON_TEXT
++    ] or ["the evidence the receipt check reported as missing"]
++    return (
++        "[System: The product receipt is not ready yet. Missing: "
++        + "; ".join(missing)
++        + ". You have exactly one more web_search and one more web_extract for "
++        "this request. Use the search to find pages that supply what is missing, "
++        "then extract the exact returned URLs in one batch (several URLs are "
++        "allowed). Do not re-extract a URL that already succeeded. Then call the "
++        "receipt again; if it is still not ready, the request will be withheld.]"
++    )
++
++
+ def prepare_product_research_controller_receipt(
+     agent: Any, tool_calls: Any, messages: Any
+ ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+@@ -2881,6 +2938,37 @@ def prepare_product_research_source_mix(
+         # Never spend synthesis retries on a packet already known to be
+         # impossible.
+         turn_id = getattr(agent, "_current_turn_id", None)
++        if (
++            _product_research_repair_fetch_enabled()
++            and isinstance(turn_id, str)
++            and turn_id
++            and getattr(agent, "_product_research_repair_grant_turn_id", None) != turn_id
++        ):
++            # One repair round instead of withholding: re-open exactly one
++            # search and one extraction, name the missing evidence, and let a
++            # second unready receipt request fall through to the failure below.
++            agent._product_research_repair_grant_turn_id = turn_id
++            agent._product_research_search_budget_exhausted_turn_id = None
++            agent._product_research_extract_budget_exhausted_turn_id = None
++            logger.info(
++                "Product research repair fetch granted: reasons=%s searches=%d "
++                "extracts=%d session=%s",
++                ",".join(viability_reasons) or "none",
++                search_count,
++                extract_count,
++                getattr(agent, "session_id", None) or "none",
++            )
++            return (
++                [],
++                _product_repair_fetch_nudge(viability_reasons),
++                {
++                    "mode": "receipt_repair_fetch_granted",
++                    "viability_reasons": list(viability_reasons),
++                    "successful_sources": len(successful),
++                    "search_calls": search_count,
++                    "extract_calls": extract_count,
++                },
++            )
+         agent._product_research_receipt_viability_failure_turn_id = turn_id
+         agent._product_research_receipt_viability_failure_reasons = tuple(
+             viability_reasons
+@@ -3533,7 +3621,7 @@ def observe_product_research_tool_result(agent: Any, tool_name: str) -> None:
+     if tool_name == "web_search":
+         count = int(getattr(agent, "_product_research_search_call_count", 0) or 0) + 1
+         agent._product_research_search_call_count = count
+-        if count >= PRODUCT_RESEARCH_MAX_SEARCH_CALLS:
++        if count >= PRODUCT_RESEARCH_MAX_SEARCH_CALLS + _product_research_repair_bonus(agent):
+             agent._product_research_search_budget_exhausted_turn_id = turn_id
+         if (
+             getattr(
+@@ -3547,7 +3635,7 @@ def observe_product_research_tool_result(agent: Any, tool_name: str) -> None:
+     elif tool_name == "web_extract":
+         count = int(getattr(agent, "_product_research_extract_call_count", 0) or 0) + 1
+         agent._product_research_extract_call_count = count
+-        if count >= PRODUCT_RESEARCH_MAX_EXTRACT_CALLS:
++        if count >= PRODUCT_RESEARCH_MAX_EXTRACT_CALLS + _product_research_repair_bonus(agent):
+             agent._product_research_extract_budget_exhausted_turn_id = turn_id
+ 
+ 
+diff --git a/agent/quality_first_route.py b/agent/quality_first_route.py
+index 60e9eb8ec..46af0997d 100644
+--- a/agent/quality_first_route.py
++++ b/agent/quality_first_route.py
+@@ -54,6 +54,9 @@ def _comparison_clauses(prompt: str) -> list[tuple[str, str]]:
+         r"\bcompare\s+(?P<targets>.+?)\s+for\s+.+?" + sentence_end,
+         r"\bcompare\s+(?P<targets>.+?)\s+on\s+(?P<criteria>.+?)" + sentence_end,
+         r"\bresearch\s+(?P<targets>.+?)\s+for\s+.+?" + sentence_end,
++        # "Research the best X under $N for Y, comparing A, B and C." names the
++        # alternatives in a participle clause rather than after "compare".
++        r"\bcomparing\s+(?P<targets>.+?)" + sentence_end,
+     )
+     for pattern in patterns:
+         match = re.search(pattern, prompt, flags=re.IGNORECASE | re.DOTALL)
+@@ -69,16 +72,18 @@ def _comparison_clauses(prompt: str) -> list[tuple[str, str]]:
+ def extract_targets(prompt: str) -> list[str]:
+     """Copy explicitly compared alternatives without inventing candidates."""
+ 
+-    clauses = _comparison_clauses(prompt)
+-    if not clauses:
+-        return []
+-    target_clause = clauses[0][0]
+-    targets: list[str] = []
+-    for raw in _SPLIT_TARGET_RE.split(target_clause):
+-        value = _GENERIC_TARGET_PREFIX_RE.sub("", _clean_fragment(raw))
+-        if len(value) >= 3 and value.casefold() not in {v.casefold() for v in targets}:
+-            targets.append(value)
+-    return targets if 2 <= len(targets) <= 8 else []
++    # The first clause that names 2-8 alternatives wins: a broad "research the
++    # best X for Y" clause names a category, not alternatives, and must not
++    # shadow a later explicit list.
++    for target_clause, _criteria in _comparison_clauses(prompt):
++        targets: list[str] = []
++        for raw in _SPLIT_TARGET_RE.split(target_clause):
++            value = _GENERIC_TARGET_PREFIX_RE.sub("", _clean_fragment(raw))
++            if len(value) >= 3 and value.casefold() not in {v.casefold() for v in targets}:
++                targets.append(value)
++        if 2 <= len(targets) <= 8:
++            return targets
++    return []
+ 
+ 
+ def extract_criteria(prompt: str) -> list[str]:
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+new file mode 100644
+index 000000000..d39a2c901
+--- /dev/null
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -0,0 +1,130 @@
++"""One controller-granted repair fetch before an unready product receipt is withheld."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++from agent.product_route import (
++    PRODUCT_RESEARCH_MAX_EXTRACT_CALLS,
++    PRODUCT_RESEARCH_REPAIR_FETCH_ENV,
++    PRODUCT_RESEARCH_SOURCE_MIX_NUDGE_LIMIT,
++    bound_product_research_receipt_command,
++    constrain_product_research_tool_calls,
++    observe_product_research_tool_result,
++    prepare_product_research_source_mix,
++    product_research_terminal_reason,
++)
++from agent.quality_first_route import extract_targets
++from tests.agent.test_product_route import _agent, _extract_messages, _search_messages
++
++
++def _exhausted_scenario():
++    agent = _agent()
++    agent.api_mode = "chat_completions"
++    agent._product_research_source_mix_nudge_count = PRODUCT_RESEARCH_SOURCE_MIX_NUDGE_LIMIT
++    reviews = [
++        "https://www.forbes.com/home/best-robot-vacuum",
++        "https://www.techgearlab.com/reviews/roborock-q5-max-plus",
++        "https://www.thesmarthomehookup.com/budget-robot-vacuum",
++    ]
++    missing_official = "https://global.roborock.com/pages/roborock-q5-max-plus"
++    messages = [{"role": "user", "content": "Research the best robot vacuum under $400 for pet hair and rugs."}]
++    messages += _search_messages("best robot vacuum under 400", reviews, "1")
++    messages += _extract_messages(reviews, "1", {
++        reviews[0]: "Roborock Q5 Max+ is a contender at $399.",
++        reviews[1]: "Roborock Q5 Max+ costs under $400 and tested well.",
++        reviews[2]: "Roborock Q5 Max+ costs $360 and led pickup testing.",
++    })
++    messages += _search_messages("site:roborock.com q5 max plus", [missing_official], "2")
++    messages += [{
++        "role": "assistant", "content": "",
++        "tool_calls": [{"id": "extract-2", "type": "function", "function": {
++            "name": "web_extract", "arguments": json.dumps({"urls": [missing_official]})}}],
++    }, {
++        "role": "tool", "tool_call_id": "extract-2", "name": "web_extract",
++        "content": json.dumps({"results": [{"url": missing_official, "title": "", "content": "",
++                                            "error": "Failed to fetch url"}]}),
++    }]
++    receipt = SimpleNamespace(id="receipt-1", function=SimpleNamespace(
++        name="terminal",
++        arguments=json.dumps({"command": bound_product_research_receipt_command(agent.session_id), "timeout": 30}),
++    ))
++    agent._product_research_extract_call_count = PRODUCT_RESEARCH_MAX_EXTRACT_CALLS
++    agent._product_research_extract_budget_exhausted_turn_id = "turn-1"
++    return agent, messages, receipt
++
++
++def test_unready_receipt_after_exhaustion_gets_one_repair_fetch(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
++
++    assert calls == []
++    assert details["mode"] == "receipt_repair_fetch_granted"
++    assert details["viability_reasons"] == ["official_product_evidence_missing"]
++    assert "official manufacturer product page" in nudge and "exactly one more web_search" in nudge
++    assert agent._product_research_repair_grant_turn_id == "turn-1"
++    assert agent._product_research_extract_budget_exhausted_turn_id is None
++    assert getattr(agent, "_product_research_receipt_viability_failure_turn_id", None) is None
++    assert product_research_terminal_reason(agent, json.loads(receipt.function.arguments)) is None
++
++
++def test_second_unready_receipt_in_the_same_turn_is_withheld(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    prepare_product_research_source_mix(agent, [receipt], messages)
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
++
++    assert calls == [receipt] and nudge is None
++    assert details["mode"] == "receipt_viability_exhausted"
++    assert agent._product_research_receipt_viability_failure_turn_id == "turn-1"
++    assert "not receipt-ready" in product_research_terminal_reason(agent, json.loads(receipt.function.arguments))
++
++
++def test_repair_fetch_is_off_without_the_environment_switch(monkeypatch):
++    monkeypatch.delenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, raising=False)
++    agent, messages, receipt = _exhausted_scenario()
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
++
++    assert details["mode"] == "receipt_viability_exhausted"
++    assert getattr(agent, "_product_research_repair_grant_turn_id", None) is None
++
++
++def test_granted_turn_admits_and_counts_exactly_one_more_extract(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    extra = SimpleNamespace(id="extract-3", function=SimpleNamespace(
++        name="web_extract", arguments=json.dumps({"urls": ["https://www.rtings.com/vacuum/reviews/roborock/q5"]})))
++
++    before, dropped_before = constrain_product_research_tool_calls(agent, [extra], messages)
++    assert before == [] and dropped_before.get("web_extract") == 1
++
++    prepare_product_research_source_mix(agent, [receipt], messages)
++    after, dropped_after = constrain_product_research_tool_calls(agent, [extra], messages)
++    assert after == [extra] and "web_extract" not in dropped_after
++
++    observe_product_research_tool_result(agent, "web_extract")
++    assert agent._product_research_extract_budget_exhausted_turn_id == "turn-1"
++
++
++def test_targets_named_after_comparing_are_extracted():
++    prompt = ("Research the best 27-inch 4K monitor under $400 for photo editing and office work, "
++              "comparing the Dell S2722QC, LG 27UP850N-W and ASUS ProArt PA279CRV. Use each "
++              "manufacturer's official product page for color gamut.")
++    assert extract_targets(prompt) == ["Dell S2722QC", "LG 27UP850N-W", "ASUS ProArt PA279CRV"]
++
++
++def test_broad_research_clause_does_not_shadow_a_later_named_list():
++    prompt = ("Research the best mesh Wi-Fi system under $300 for a two-story home, comparing the "
++              "TP-Link Deco X55 (3-pack), eero 6+ (3-pack) and Google Nest Wifi Pro (2-pack).")
++    assert extract_targets(prompt) == ["TP-Link Deco X55 (3-pack)", "eero 6+ (3-pack)", "Google Nest Wifi Pro (2-pack)"]
++
++
++def test_compare_for_phrasing_is_unchanged():
++    assert extract_targets("Compare the Kindle Paperwhite and Kobo Clara BW for reading at night.") == [
++        "Kindle Paperwhite", "Kobo Clara BW"]
++    assert extract_targets("Research the best robot vacuum under $400 for pet hair.") == []

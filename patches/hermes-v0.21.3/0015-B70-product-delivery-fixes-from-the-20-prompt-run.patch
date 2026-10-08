@@ -1,0 +1,299 @@
+From c2d24a32dcbecea8328abe890d0ff5ae89cecd34 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 22:31:41 +0000
+Subject: [PATCH 15/18] B70: product delivery fixes from the 20-prompt run
+
+Of 20 Telegram product requests on 2026-10-07, 11 were withheld. Causes fixed:
+
+- Target parsing: a full stop after a digit was never a sentence end, so
+  'comparing ... Honeywell Home T9. Use each manufacturer's ...' made the last
+  target swallow the next sentence (bogus targets such as 'warranty'); the
+  'research X for' clause could also run across sentences. Sentence ends are
+  now any [.!?] not followed by a digit, and target clauses stay inside one
+  sentence ('Aventon Level.2' still parses). All 10 named-comparison prompts
+  now yield their three products; viability replay makes 3 previously
+  withheld turns receipt-ready.
+- Turn window: a length/network continuation nudge ended the current-turn
+  window, resetting search/extract counts to 0 and causing
+  RESEARCH_RECEIPT_ERROR; such nudges are now skipped like synthetic rows.
+- A receipt/terminal call after searches but no extraction is rewritten into
+  the first extraction (round-robin over search batches, one URL per family).
+- Alternative coverage ignores parenthetical qualifiers; the quality-first
+  repair nudge names the missing alternatives and, for missing citations,
+  lists the citable receipt URLs; rejected drafts log defects and missing
+  alternatives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 76 ++++++++++++++++++++++
+ agent/quality_first_route.py             | 30 ++++++---
+ tests/agent/test_product_repair_fetch.py | 80 ++++++++++++++++++++++++
+ 3 files changed, 178 insertions(+), 8 deletions(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index fe76edcea..1a7d3e93a 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -1048,6 +1048,16 @@ def _product_current_turn_messages(messages: Any) -> list[Mapping[str, Any]]:
+         if message.get("role") == "user":
+             if message.get("_product_research_synthetic") is True:
+                 continue
++            # A length/network continuation nudge is loop scaffolding, not a new
++            # operator turn; ending the window there reset the turn's search and
++            # extract counts to zero (2026-10-07 21:24, RESEARCH_RECEIPT_ERROR).
++            if message.get("_length_continuation_nudge") is True:
++                continue
++            content = message.get("content")
++            if isinstance(content, str) and content.strip().startswith(
++                _PRODUCT_RESEARCH_SYSTEM_CONTINUATION_PREFIXES
++            ):
++                continue
+             break
+         current.append(message)
+     current.reverse()
+@@ -2760,6 +2770,42 @@ def prepare_product_research_source_mix(
+                 details["coalesced_terminal_detours"] = len(calls) - 1
+             return normalized_calls, None, details
+ 
++    if (
++        name == "terminal"
++        and arguments is not None
++        and search_count > 0
++        and extract_count == 0
++    ):
++        # Retrieval stopped after searching but before any extraction (a
++        # receipt or detour with nothing to bind; 2026-10-07 22:00 ended in
++        # RESEARCH_RECEIPT_ERROR).  Spend the first extraction on searched URLs
++        # instead, round-robin across the search batches, one per source family.
++        batches = [
++            [u for u in (_safe_product_recovery_url(url) for url in batch) if u]
++            for batch in _product_search_url_batches(current_messages)
++        ]
++        planned: list[str] = []
++        families: set[str] = set()
++        for depth in range(max((len(b) for b in batches), default=0)):
++            for batch in batches:
++                if depth < len(batch) and len(planned) < PRODUCT_RESEARCH_RECOVERY_MAX_URLS:
++                    family = _product_source_family(batch[depth]) or batch[depth]
++                    if family not in families:
++                        families.add(family)
++                        planned.append(batch[depth])
++        if planned:
++            function = getattr(calls[0], "function", None)
++            function.name = "web_extract"
++            function.arguments = json.dumps(
++                {"urls": planned}, ensure_ascii=False, separators=(",", ":")
++            )
++            normalized_calls = [calls[0]] if parallel_terminal_calls else calls
++            return normalized_calls, None, {
++                "mode": "zero_extract_terminal_to_extract",
++                "search_calls": search_count,
++                "extract_urls": len(planned),
++            }
++
+     proposed_query = (
+         arguments.get("query").strip()
+         if name == "web_search"
+@@ -5721,6 +5767,14 @@ def validate_product_research_response(
+         diagnostics = response_diagnostics(response, original_request, raw_sources)
+         agent._product_research_quality_first_diagnostics = diagnostics
+         if not diagnostics.get("passed"):
++            logger.info(
++                "Product research quality-first draft rejected: defects=%s "
++                "missing_alternatives=%s cited=%d session=%s",
++                ",".join(str(d) for d in diagnostics.get("defects") or []) or "none",
++                " | ".join(str(m) for m in diagnostics.get("missing_alternatives") or []) or "none",
++                len(diagnostics.get("cited_urls") or []),
++                getattr(agent, "session_id", None) or "none",
++            )
+             defects = diagnostics.get("defects")
+             primary = (
+                 str(defects[0])
+@@ -6095,12 +6149,34 @@ def product_research_finalization_nudge(reason: str, agent: Any = None) -> str:
+         diagnostics = getattr(
+             agent, "_product_research_quality_first_diagnostics", {}
+         )
++        specific = ""
++        missing = diagnostics.get("missing_alternatives") if isinstance(diagnostics, Mapping) else None
++        if isinstance(missing, list) and missing:
++            specific += (
++                " Name each of these requested alternatives exactly as written, in "
++                "its own sentence, even if the evidence only lets you say it could "
++                "not be verified: " + "; ".join(str(m) for m in missing[:8]) + "."
++            )
++        defects = diagnostics.get("defects") if isinstance(diagnostics, Mapping) else None
++        sources = getattr(agent, "_product_research_receipt_sources", ())
++        if (
++            isinstance(defects, list)
++            and "citations_missing" in defects
++            and isinstance(sources, (list, tuple))
++            and sources
++        ):
++            specific += (
++                " Cite sources inline as Markdown links [label](url) on the "
++                "sentences they support, using only these URLs: "
++                + " ".join(str(u) for u in list(sources)[:10]) + "."
++            )
+         return (
+             "[System: One focused quality-first repair is allowed. Tools remain "
+             "closed. Correct only these deterministic defects, recheck every hard "
+             "constraint, preserve supported material, and return the complete "
+             "replacement answer: "
+             + json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":"))[:8000]
++            + specific
+             + "]"
+         )
+     original_request = str(
+diff --git a/agent/quality_first_route.py b/agent/quality_first_route.py
+index 46af0997d..c69455fb1 100644
+--- a/agent/quality_first_route.py
++++ b/agent/quality_first_route.py
+@@ -49,14 +49,14 @@ def _comparison_clauses(prompt: str) -> list[tuple[str, str]]:
+     """Return bounded target/criteria clauses copied from ordinary prose."""
+ 
+     clauses: list[tuple[str, str]] = []
+-    sentence_end = r"(?:(?<!\d)[.!?](?!\d)|$)"
++    sentence_end = r"(?:[.!?](?!\d)|$)"
+     patterns = (
+-        r"\bcompare\s+(?P<targets>.+?)\s+for\s+.+?" + sentence_end,
+-        r"\bcompare\s+(?P<targets>.+?)\s+on\s+(?P<criteria>.+?)" + sentence_end,
+-        r"\bresearch\s+(?P<targets>.+?)\s+for\s+.+?" + sentence_end,
++        r"\bcompare\s+(?P<targets>(?:[^.!?]|[.!?](?=\d))+?)\s+for\s+.+?" + sentence_end,
++        r"\bcompare\s+(?P<targets>(?:[^.!?]|[.!?](?=\d))+?)\s+on\s+(?P<criteria>.+?)" + sentence_end,
++        r"\bresearch\s+(?P<targets>(?:[^.!?]|[.!?](?=\d))+?)\s+for\s+.+?" + sentence_end,
+         # "Research the best X under $N for Y, comparing A, B and C." names the
+         # alternatives in a participle clause rather than after "compare".
+-        r"\bcomparing\s+(?P<targets>.+?)" + sentence_end,
++        r"\bcomparing\s+(?P<targets>(?:[^.!?]|[.!?](?=\d))+?)" + sentence_end,
+     )
+     for pattern in patterns:
+         match = re.search(pattern, prompt, flags=re.IGNORECASE | re.DOTALL)
+@@ -92,7 +92,7 @@ def extract_criteria(prompt: str) -> list[str]:
+     criteria_clause = ""
+     compare_matches = list(
+         re.finditer(
+-            r"\bcompare\s+(?P<body>.+?)(?:(?<!\d)[.!?](?!\d)|$)",
++            r"\bcompare\s+(?P<body>.+?)(?:[.!?](?!\d)|$)",
+             prompt,
+             flags=re.IGNORECASE | re.DOTALL,
+         )
+@@ -268,6 +268,21 @@ def synthesis_messages(
+     return messages
+ 
+ 
++_TARGET_QUALIFIER_RE = re.compile(r"\([^)]*\)")
++
++
++def _target_coverage_tokens(target: str) -> list[str]:
++    """Name tokens an answer must contain to count as covering ``target``.
++
++    Parenthetical qualifiers ("(4th gen)", "(3-pack)") are dropped: answers
++    legitimately write "fourth-generation" or omit the pack size, and requiring
++    them withheld otherwise complete comparisons.
++    """
++
++    core = _TARGET_QUALIFIER_RE.sub(" ", target)
++    return [token for token in re.findall(r"[A-Za-z0-9]+", core) if len(token) >= 2]
++
++
+ def response_diagnostics(
+     response: Any,
+     prompt: str,
+@@ -285,8 +300,7 @@ def response_diagnostics(
+         for target in extract_targets(prompt)
+         if not all(
+             token.casefold() in text.casefold()
+-            for token in re.findall(r"[A-Za-z0-9]+", target)
+-            if len(token) >= 2
++            for token in _target_coverage_tokens(target)
+         )
+     ]
+     criteria_missing: list[str] = []
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index 2474f7293..9bd8c9f6b 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -190,3 +190,83 @@ def test_spent_recovery_still_blocks_a_second_extraction_rewrite():
+     recovered, details = apply_product_research_receipt_recovery(agent, [detour], messages)
+ 
+     assert details is None and detour.function.name == "terminal"
++
++
++def test_current_turn_window_spans_a_length_continuation_nudge():
++    from agent.product_route import _product_current_turn_messages, _product_source_mix_state
++
++    messages = [{"role": "user", "content": "Research the best video doorbell under $200."}]
++    messages += _search_messages("eufy E340 official", ["https://www.eufy.com/e340"], "1")
++    messages += _extract_messages(["https://www.eufy.com/e340"], "1")
++    messages += [
++        {"role": "assistant", "content": "# Video Doorbell Under $200\n\nThe eufy E340 is"},
++        {"role": "user", "content": "[System: Your previous response was truncated by the output length limit. "
++                                    "Continue exactly where you left off. Do not restart or repeat prior text. "
++                                    "Finish the answer directly.]"},
++    ]
++    tagged = messages[:-1] + [dict(messages[-1], content="continue", _length_continuation_nudge=True)]
++
++    for history in (messages, tagged):
++        window = _product_current_turn_messages(history)
++        mix = _product_source_mix_state(window)
++        assert len(mix["search_records"]) == 1
++        assert sum(1 for m in window if m.get("name") == "web_extract") == 1
++
++
++def test_current_turn_window_still_stops_at_a_real_user_turn():
++    from agent.product_route import _product_current_turn_messages
++
++    messages = [{"role": "user", "content": "first request"}]
++    messages += _search_messages("q", ["https://a.example/x"], "1")
++    messages += [{"role": "assistant", "content": "answer"}, {"role": "user", "content": "now something else"}]
++    assert _product_current_turn_messages(messages) == []
++
++
++def test_receipt_after_searches_without_extraction_becomes_first_extract():
++    from agent.verified_tool_delivery import GENERIC_RESEARCH_RECEIPT_ABSOLUTE_COMMAND
++
++    agent = _agent()
++    agent.api_mode = "chat_completions"
++    messages = [{"role": "user", "content": "Research the best Wi-Fi 7 router under $400 for an apartment."}]
++    messages += _search_messages("best wifi 7 router", ["https://www.rtings.com/router/best", "https://www.pcmag.com/picks/wifi7"], "1")
++    messages += _search_messages("TP-Link Archer BE550 official", ["https://www.tp-link.com/us/home-networking/wifi-router/archer-be550/"], "2")
++    receipt = SimpleNamespace(id="r", function=SimpleNamespace(
++        name="terminal", arguments=json.dumps({"command": GENERIC_RESEARCH_RECEIPT_ABSOLUTE_COMMAND, "timeout": 30})))
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
++
++    assert details["mode"] == "zero_extract_terminal_to_extract" and nudge is None
++    assert receipt.function.name == "web_extract"
++    urls = json.loads(receipt.function.arguments)["urls"]
++    assert urls[:2] == ["https://www.rtings.com/router/best", "https://www.tp-link.com/us/home-networking/wifi-router/archer-be550/"]
++    assert len(urls) == 3
++
++
++def test_alternative_coverage_ignores_parenthetical_qualifiers():
++    from agent.quality_first_route import response_diagnostics
++
++    prompt = ("Research the best smart thermostat under $250 for a two-story house, comparing the Google Nest "
++              "Learning Thermostat (4th gen), ecobee Smart Thermostat Premium and Honeywell Home T9. Recommend one.")
++    answer = ("The fourth-generation Google Nest Learning Thermostat [N](https://n.example/a) is good; the ecobee "
++              "Smart Thermostat Premium [E](https://e.example/b) and Honeywell Home T9 [H](https://h.example/c) are alternatives.")
++    d = response_diagnostics(answer, prompt, ["https://n.example/a", "https://e.example/b", "https://h.example/c"])
++    assert d["missing_alternatives"] == []
++
++    d = response_diagnostics(answer.replace("Honeywell Home T9", "Honeywell"), prompt,
++                             ["https://n.example/a", "https://e.example/b", "https://h.example/c"])
++    assert d["missing_alternatives"] == ["Honeywell Home T9"]
++
++
++def test_quality_first_nudge_names_missing_alternatives_and_citable_urls():
++    from agent.product_route import product_research_finalization_nudge
++
++    agent = SimpleNamespace(
++        _product_research_quality_first_diagnostics={
++            "passed": False, "defects": ["alternative_coverage_missing", "citations_missing"],
++            "missing_alternatives": ["Fully Jarvis"], "cited_urls": []},
++        _product_research_receipt_sources=("https://a.example/x", "https://b.example/y"),
++    )
++    text = product_research_finalization_nudge("quality_first_alternative_coverage_missing", agent)
++
++    assert "exactly as written" in text and "Fully Jarvis" in text
++    assert "[label](url)" in text and "https://a.example/x" in text

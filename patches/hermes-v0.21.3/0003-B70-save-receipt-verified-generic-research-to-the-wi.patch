@@ -1,0 +1,461 @@
+From 78f1eeb2e9bc5032166751d97d87da0fd8d44d99 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 21:51:04 +0000
+Subject: [PATCH 03/18] B70: save receipt-verified generic research to the wiki
+ on explicit request
+
+A research request that explicitly asks to save to the wiki now arms the
+guarded generic research route. The controller offers only the bounded
+tools, rejects stray calls and captures the receipt automatically, and
+the model is told the controller will save. After the final answer
+passes the receipt check, the controller (never the model) creates one
+new note under research/ in OBSIDIAN_VAULT_PATH. It uses O_EXCL, never
+overwrites (same-day collisions get -2, -3 ...), records the request,
+the date, the receipt sources and review_status: unreviewed, rereads and
+hash-checks the note, and appends "Saved to wiki: <path>" or "Not saved
+to wiki: <reason>" to the reply. A negated request ("do not save ...")
+does not save. User-authorized on 2026-09-27.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/generic_research_publisher.py           | 137 ++++++++++++++++++
+ agent/generic_research_route.py               |  39 ++++-
+ agent/research_finalizer.py                   |  17 +++
+ agent/research_turn_context.py                |   7 +-
+ .../agent/test_generic_research_publisher.py  | 131 +++++++++++++++++
+ 5 files changed, 329 insertions(+), 2 deletions(-)
+ create mode 100644 agent/generic_research_publisher.py
+ create mode 100644 tests/agent/test_generic_research_publisher.py
+
+diff --git a/agent/generic_research_publisher.py b/agent/generic_research_publisher.py
+new file mode 100644
+index 000000000..42b112ac0
+--- /dev/null
++++ b/agent/generic_research_publisher.py
+@@ -0,0 +1,137 @@
++"""Create-only wiki notes for receipt-verified generic research (B70, user-authorized 2026-09-27).
++
++When the operator's research request explicitly asks to save to the wiki, the controller saves the delivered,
++receipt-verified answer as one new note under ``research/`` in the configured Obsidian vault. The model never
++writes, and the controller never replaces or edits existing content:
++- the target is chosen here (``research/<slug>-<date>.md``, with ``-2``, ``-3`` … on a same-day collision);
++- the note is created with ``O_EXCL`` and fsynced, then reread and hash-checked before success is reported;
++- it records the request, the date, the receipt-bound source URLs and ``review_status: unreviewed``.
++Mechanical custody only: a saved note is not factual verification.
++"""
++from __future__ import annotations
++
++import datetime as dt
++import hashlib
++import json
++import os
++import re
++import unicodedata
++from pathlib import Path
++from typing import Any, Sequence
++
++RESEARCH_DIRECTORY = "research"
++MAX_SAME_DAY_NOTES = 20
++_LEADING_VERB_RE = re.compile(r"^\s*(?:please\s+)?(?:research|investigate|look\s+up)\s+(?:the\s+|a\s+|an\s+)?", re.IGNORECASE)
++_SAVE_CLAUSE_RE = re.compile(r"[.;,]?\s*(?:and\s+)?(?:then\s+)?(?:save|add|write|publish|store|put)\b.*$", re.IGNORECASE | re.DOTALL)
++
++
++class GenericResearchPublicationError(RuntimeError):
++    """A bounded publication failure that is safe to show the operator."""
++
++
++def _slugify(value: str) -> str:
++    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
++    slug = re.sub(r"[^a-z0-9]+", "-", normalized.casefold()).strip("-")
++    return re.sub(r"-{2,}", "-", slug)[:80].rstrip("-")
++
++
++def research_note_title(operator_prompt: str, response: str) -> str:
++    """The research subject from the request (before any colon or save clause); else the answer's first heading."""
++    text = " ".join(str(operator_prompt or "").split())
++    subject = _SAVE_CLAUSE_RE.sub("", _LEADING_VERB_RE.sub("", text, count=1)).split(":", 1)[0].strip(" .")
++    if len(_slugify(subject)) >= 4:
++        return subject[:120].strip()
++    for line in str(response or "").splitlines():
++        heading = line.strip().lstrip("#").strip()
++        if line.lstrip().startswith("#") and len(_slugify(heading)) >= 4:
++            return heading[:120]
++    return "Research note"
++
++
++def render_research_note(*, title: str, operator_prompt: str, response: str, sources: Sequence[str], session_id: str,
++                         today: dt.date) -> bytes:
++    source_list = [str(url) for url in sources]
++    lines = ["---", f"title: {json.dumps(title, ensure_ascii=False)}", f"date: {today.isoformat()}", "status: draft",
++             "review_status: unreviewed", "source: hermes-generic-research", f"session_id: {json.dumps(session_id)}",
++             f"request: {json.dumps(' '.join(str(operator_prompt).split()), ensure_ascii=False)}", "sources:"]
++    lines += [f"  - {json.dumps(url, ensure_ascii=False)}" for url in source_list]
++    lines += [f"receipt_sources_sha256: {hashlib.sha256(json.dumps(source_list).encode()).hexdigest()}", "---", "",
++              f"# {title}", "", str(response).strip(), "",
++              f"*Saved by Hermes research on {today.isoformat()} from receipt-verified sources; unreviewed.*", ""]
++    return "\n".join(lines).encode("utf-8")
++
++
++def _write_exclusive(path: Path, payload: bytes) -> None:
++    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    try:
++        with os.fdopen(descriptor, "wb") as handle:
++            handle.write(payload); handle.flush(); os.fsync(handle.fileno())
++    except Exception:
++        path.unlink(missing_ok=True)
++        raise
++
++
++def publish_generic_research(*, vault: Path, operator_prompt: str, response: str, sources: Sequence[str],
++                             session_id: str, now: dt.datetime | None = None) -> tuple[str, str]:
++    """Create one new note; returns (vault-relative path, sha256 of the reread bytes)."""
++    if not str(response or "").strip():
++        raise GenericResearchPublicationError("the verified answer is empty")
++    if len(sources) < 2:
++        raise GenericResearchPublicationError("the answer has fewer than two receipt-bound sources")
++    resolved_vault = Path(vault).expanduser().resolve()
++    if not resolved_vault.is_dir():
++        raise GenericResearchPublicationError("configured Obsidian vault is unavailable")
++    folder = resolved_vault / RESEARCH_DIRECTORY
++    if folder.is_symlink():
++        raise GenericResearchPublicationError("research directory may not be a symbolic link")
++    folder.mkdir(parents=True, exist_ok=True)
++    if folder.resolve().parent != resolved_vault:
++        raise GenericResearchPublicationError("research directory escaped the configured vault")
++    today = (now or dt.datetime.now().astimezone()).date()
++    title = research_note_title(operator_prompt, response)
++    slug = _slugify(title) or "research-note"
++    payload = render_research_note(title=title, operator_prompt=operator_prompt, response=response, sources=sources,
++                                   session_id=session_id, today=today)
++    for index in range(1, MAX_SAME_DAY_NOTES + 1):
++        name = f"{slug}-{today.isoformat()}" + ("" if index == 1 else f"-{index}") + ".md"
++        target = folder / name
++        try:
++            _write_exclusive(target, payload)
++        except FileExistsError:
++            continue
++        reread = target.read_bytes()
++        digest = hashlib.sha256(reread).hexdigest()
++        if digest != hashlib.sha256(payload).hexdigest():
++            raise GenericResearchPublicationError("saved note did not reread identically")
++        return target.relative_to(resolved_vault).as_posix(), digest
++    raise GenericResearchPublicationError("too many notes with this name today; nothing was overwritten")
++
++
++def save_verified_generic_research(agent: Any, response: str) -> str:
++    """Save the delivered answer when the operator asked; return the status line to append (or '')."""
++    if getattr(agent, "_generic_research_save_requested", False) is not True:
++        return ""
++    try:
++        vault = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
++        if not vault:
++            raise GenericResearchPublicationError("configured Obsidian vault is unavailable")
++        path, digest = publish_generic_research(
++            vault=Path(vault), operator_prompt=str(getattr(agent, "_generic_research_operator_prompt", "") or ""),
++            response=response, sources=tuple(getattr(agent, "_generic_research_receipt_sources", ()) or ()),
++            session_id=str(getattr(agent, "session_id", "") or ""))
++    except GenericResearchPublicationError as exc:
++        return f"\n\n---\nNot saved to wiki: {exc}."
++    except OSError as exc:
++        return f"\n\n---\nNot saved to wiki: file system error ({exc.__class__.__name__})."
++    return f"\n\n---\nSaved to wiki: `{path}` (new note, unreviewed; sha256 {digest[:12]})."
++
++
++def withheld_save_status(agent: Any) -> str:
++    """Status line for a withheld answer when saving was requested (nothing is written)."""
++    if getattr(agent, "_generic_research_save_requested", False) is not True:
++        return ""
++    return "\n\n---\nNot saved to wiki: the research answer did not pass its source check."
++
++
++__all__ = ["GenericResearchPublicationError", "publish_generic_research", "render_research_note",
++           "research_note_title", "save_verified_generic_research", "withheld_save_status"]
+diff --git a/agent/generic_research_route.py b/agent/generic_research_route.py
+index 943dd1139..534ffa90f 100644
+--- a/agent/generic_research_route.py
++++ b/agent/generic_research_route.py
+@@ -68,6 +68,23 @@ _RESEARCH_INTENT_RE = re.compile(
+     r"current\s+best\s+practices?)\b",
+     re.IGNORECASE,
+ )
++# An explicit request to save the research into the Obsidian wiki (B70, user-authorized 2026-09-27). The
++# verified answer is then saved by the controller; plain research questions never write.
++_WIKI_SAVE_INTENT_RE = re.compile(
++    r"\b(?:save|add|write|publish|store|put)\b[^.?!\n]{0,80}\b(?:wiki|obsidian|vault)\b"
++    r"|\b(?:as|into|in|to)\s+(?:a\s+|an\s+|my\s+|the\s+)?(?:wiki|obsidian)\s+(?:article|page|note|entry)\b",
++    re.IGNORECASE,
++)
++_NEGATED_SAVE_RE = re.compile(
++    r"\b(?:do\s+not|don't|dont|never|without|no\s+need\s+to|not)\s*(?:\w+\s*,?\s*){0,3}$",
++    re.IGNORECASE,
++)
++GENERIC_RESEARCH_SAVE_NOTE = (
++    "[System: The operator asked to save this research to the wiki. After your "
++    "receipt-verified answer is delivered, the controller saves it as a new, "
++    "unreviewed wiki note and reports the path. Do not try to save it yourself, "
++    "ask for approval, or discuss saving; just write the complete answer.]"
++)
+ _SOURCE_INTENT_RE = re.compile(
+     r"\b(?:source|sources|cite|cited|citation|primary|official|current|recent|"
+     r"latest|web|online|documentation|docs)\b",
+@@ -482,7 +499,22 @@ def requires_generic_research_route(user_message: Any) -> bool:
+         or requires_parallel_research_route(text)
+     ):
+         return False
+-    return _SOURCE_INTENT_RE.search(text) is not None
++    return (
++        _SOURCE_INTENT_RE.search(text) is not None
++        or generic_research_save_requested(text)
++    )
++
++
++def generic_research_save_requested(user_message: Any) -> bool:
++    """True when the operator explicitly asks to save this research to the wiki."""
++
++    if not isinstance(user_message, str):
++        return False
++    text = " ".join(user_message.split())
++    return any(
++        _NEGATED_SAVE_RE.search(text[: match.start()]) is None
++        for match in _WIKI_SAVE_INTENT_RE.finditer(text)
++    )
+ 
+ 
+ def arm_generic_research_route_for_turn(
+@@ -511,6 +543,9 @@ def arm_generic_research_route_for_turn(
+     agent._generic_research_source_budget_closed_turn_id = None
+     agent._generic_research_primary_recovery_turn_id = None
+     agent._generic_research_operator_prompt = str(user_message)
++    agent._generic_research_save_requested = generic_research_save_requested(
++        str(user_message)
++    )
+     agent._generic_research_comparison_alternatives = _comparison_alternatives(
+         str(user_message)
+     )
+@@ -1457,6 +1492,7 @@ __all__ = [
+     "GENERIC_RESEARCH_MAX_EXTRACT_CALLS",
+     "GENERIC_RESEARCH_MAX_SEARCH_CALLS",
+     "GENERIC_RESEARCH_ROUTE_NOTE",
++    "GENERIC_RESEARCH_SAVE_NOTE",
+     "GENERIC_RESEARCH_WITHHELD_RESPONSE",
+     "apply_generic_research_primary_recovery",
+     "arm_generic_research_route_for_turn",
+@@ -1465,6 +1501,7 @@ __all__ = [
+     "generic_research_finalization_request_overrides",
+     "generic_research_receipt_bound",
+     "generic_research_route_active",
++    "generic_research_save_requested",
+     "generic_research_source_budget_rejection",
+     "generic_research_source_texts",
+     "generic_research_tool_reason",
+diff --git a/agent/research_finalizer.py b/agent/research_finalizer.py
+index 9c04b5524..951861e71 100644
+--- a/agent/research_finalizer.py
++++ b/agent/research_finalizer.py
+@@ -58,6 +58,7 @@ class ResearchFinalization:
+         agent._generic_research_primary_recovery_turn_id = None
+         agent._generic_research_operator_prompt = ""
+         agent._generic_research_primary_sources_required = False
++        agent._generic_research_save_requested = False
+         agent._parallel_research_validator_compatibility_error_turn_id = None
+         agent._parallel_research_validator_compatibility_error = None
+         agent._parallel_research_defer_streaming_for_turn = False
+@@ -531,6 +532,16 @@ def seal_research_final(agent, *, final_response, failed, messages, _turn_exit_r
+             _generic_reason = "validator_error"
+         if _generic_delivery_passed:
+             final_response = _generic_delivery
++            try:
++                # Explicit wiki-save requests (B70, 2026-09-27): the controller, not the model, creates
++                # one new note from the delivered verified answer and reports the outcome in the reply.
++                from agent.generic_research_publisher import save_verified_generic_research
++
++                final_response += save_verified_generic_research(agent, final_response)
++            except Exception:
++                logger.warning("generic research wiki save failed", exc_info=True)
++                if getattr(agent, "_generic_research_save_requested", False) is True:
++                    final_response += "\n\n---\nNot saved to wiki: internal error."
+             agent._response_was_previewed = False
+             _seal_current_turn_assistant(
+                 final_response, "generic_research_verified"
+@@ -539,6 +550,12 @@ def seal_research_final(agent, *, final_response, failed, messages, _turn_exit_r
+             "RESEARCH_RECEIPT_ERROR "
+         ):
+             final_response = _generic_delivery
++            try:
++                from agent.generic_research_publisher import withheld_save_status
++
++                final_response += withheld_save_status(agent)
++            except Exception:
++                logger.debug("withheld save status failed", exc_info=True)
+             failed = True
+             _turn_exit_reason = "generic_research_withheld"
+             # _generic_reason is computed by validate_generic_research_response
+diff --git a/agent/research_turn_context.py b/agent/research_turn_context.py
+index b145908bb..62a559c7f 100644
+--- a/agent/research_turn_context.py
++++ b/agent/research_turn_context.py
+@@ -60,6 +60,7 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+     agent._generic_research_primary_recovery_turn_id = None
+     agent._generic_research_operator_prompt = ""
+     agent._generic_research_primary_sources_required = False
++    agent._generic_research_save_requested = False
+     agent._parallel_research_validator_compatibility_error_turn_id = None
+     agent._parallel_research_validator_compatibility_error = None
+     _ordinary_research_route_requested = False
+@@ -85,6 +86,7 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+         )
+         from agent.generic_research_route import (
+             GENERIC_RESEARCH_ROUTE_NOTE,
++            GENERIC_RESEARCH_SAVE_NOTE,
+             arm_generic_research_route_for_turn,
+             requires_generic_research_route,
+         )
+@@ -189,7 +191,10 @@ def admit_research_context(agent, user_message, persist_user_message, conversati
+                 # that immutable row to classify and bind the current turn.
+                 persist_user_message = route_message
+                 agent._persist_user_message_override = route_message
+-            user_message = f"{GENERIC_RESEARCH_ROUTE_NOTE}\n\n{user_message}"
++            route_note = GENERIC_RESEARCH_ROUTE_NOTE
++            if getattr(agent, "_generic_research_save_requested", False) is True:
++                route_note = f"{route_note}\n\n{GENERIC_RESEARCH_SAVE_NOTE}"
++            user_message = f"{route_note}\n\n{user_message}"
+         quarantine_latched = research_terminal_quarantine_latched(
+             agent, conversation_history
+         )
+diff --git a/tests/agent/test_generic_research_publisher.py b/tests/agent/test_generic_research_publisher.py
+new file mode 100644
+index 000000000..e3d292140
+--- /dev/null
++++ b/tests/agent/test_generic_research_publisher.py
+@@ -0,0 +1,131 @@
++"""Explicit wiki-save for receipt-verified generic research (B70, 2026-09-27): arming, create-only notes, status lines
++and the finalizer hook. No network, model or real vault."""
++import datetime as dt
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent.generic_research_publisher import (
++    GenericResearchPublicationError,
++    publish_generic_research,
++    research_note_title,
++    save_verified_generic_research,
++    withheld_save_status,
++)
++from agent.generic_research_route import (
++    arm_generic_research_route_for_turn,
++    bind_generic_research_receipt,
++    generic_research_save_requested,
++    requires_generic_research_route,
++)
++from agent.product_route import requires_product_research_route
++
++SAVE_PROMPT = (
++    "Research the Blackstone 36-inch Original Griddle (propane): cooking area, number of burners and heat output, "
++    "assembly, seasoning and cleaning, dimensions and weight, and warranty. Save it as a wiki article."
++)
++URLS = ["https://blackstoneproducts.com/products/36-griddle", "https://www.bbqguys.com/i/3078923/blackstone-1899"]
++NOW = dt.datetime(2026, 9, 27, 21, 0, tzinfo=dt.timezone.utc)
++
++
++def _agent():
++    return SimpleNamespace(_current_turn_id="turn-1", api_mode="chat_completions", session_id="session-1",
++                           _product_research_route_session_latched=False,
++                           _travel_publication_route_session_latched=False)
++
++
++def _messages(prompt):
++    return [
++        {"role": "user", "content": prompt},
++        {"role": "assistant", "content": "", "tool_calls": [{"id": "extract-1", "type": "function", "function": {
++            "name": "web_extract", "arguments": json.dumps({"urls": URLS})}}]},
++        {"role": "tool", "name": "web_extract", "tool_call_id": "extract-1", "content": json.dumps({"results": [
++            {"url": URLS[0], "content": "36 inch griddle station, four burners"},
++            {"url": URLS[1], "content": "769 sq in cooking surface, 60,000 BTU"}]})},
++    ]
++
++
++def test_explicit_wiki_save_arms_generic_route_and_plain_research_does_not_save():
++    assert requires_generic_research_route(SAVE_PROMPT) is True
++    assert generic_research_save_requested(SAVE_PROMPT) is True
++    assert requires_product_research_route(SAVE_PROMPT) is False
++    for prompt in ("Research the Blackstone griddle and save it to my Obsidian vault.",
++                   "Research dew point and add a wiki page for it."):
++        assert generic_research_save_requested(prompt) is True
++    assert requires_generic_research_route("Research the history of Blackstone griddles.") is False
++    for prompt in ("Research current llama.cpp SYCL docs and give me cited notes.",
++                   "Research SYCL builds using primary sources and do not save anything to my vault.",
++                   "Research train fares. Do not book, buy, save, or publish anything.",
++                   "What is a wiki page?"):
++        assert generic_research_save_requested(prompt) is False
++    agent = _agent()
++    assert arm_generic_research_route_for_turn(agent, SAVE_PROMPT, "turn-1") is True
++    assert agent._generic_research_save_requested is True
++
++
++def test_note_is_created_once_and_never_overwrites(tmp_path):
++    (tmp_path / "research").mkdir()
++    first, digest = publish_generic_research(vault=tmp_path, operator_prompt=SAVE_PROMPT, response="## Specs\n- 4 burners [1]",
++                                             sources=URLS, session_id="session-1", now=NOW)
++    assert first == "research/blackstone-36-inch-original-griddle-propane-2026-09-27.md"
++    text = (tmp_path / first).read_text()
++    assert "review_status: unreviewed" in text and f'  - "{URLS[1]}"' in text and "- 4 burners [1]" in text
++    assert text.startswith('---\ntitle: "Blackstone 36-inch Original Griddle (propane)"\ndate: 2026-09-27\n')
++    second, _ = publish_generic_research(vault=tmp_path, operator_prompt=SAVE_PROMPT, response="other answer",
++                                         sources=URLS, session_id="session-2", now=NOW)
++    assert second.endswith("-2026-09-27-2.md")
++    assert "- 4 burners [1]" in (tmp_path / first).read_text()
++    import hashlib
++    assert hashlib.sha256((tmp_path / first).read_bytes()).hexdigest() == digest
++
++
++def test_publication_refuses_unsafe_or_incomplete_inputs(tmp_path):
++    with pytest.raises(GenericResearchPublicationError, match="vault is unavailable"):
++        publish_generic_research(vault=tmp_path / "missing", operator_prompt=SAVE_PROMPT, response="x", sources=URLS,
++                                 session_id="s", now=NOW)
++    with pytest.raises(GenericResearchPublicationError, match="fewer than two"):
++        publish_generic_research(vault=tmp_path, operator_prompt=SAVE_PROMPT, response="x", sources=URLS[:1],
++                                 session_id="s", now=NOW)
++    outside = tmp_path / "outside"; outside.mkdir(); vault = tmp_path / "vault"; vault.mkdir()
++    (vault / "research").symlink_to(outside)
++    with pytest.raises(GenericResearchPublicationError, match="symbolic link"):
++        publish_generic_research(vault=vault, operator_prompt=SAVE_PROMPT, response="x", sources=URLS,
++                                 session_id="s", now=NOW)
++    assert list(outside.iterdir()) == []
++
++
++def test_title_falls_back_to_answer_heading():
++    assert research_note_title("Research it and save it to the wiki", "# Dew point basics\ntext") == "Dew point basics"
++    assert research_note_title("Please research dew point: definition. Save to wiki.", "") == "dew point"
++
++
++def test_status_lines(tmp_path, monkeypatch):
++    agent = SimpleNamespace(_generic_research_save_requested=True, _generic_research_operator_prompt=SAVE_PROMPT,
++                            _generic_research_receipt_sources=tuple(URLS), session_id="session-1")
++    monkeypatch.delenv("OBSIDIAN_VAULT_PATH", raising=False)
++    assert save_verified_generic_research(agent, "answer").endswith("Not saved to wiki: configured Obsidian vault is unavailable.")
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(tmp_path))
++    status = save_verified_generic_research(agent, "answer")
++    assert "Saved to wiki: `research/blackstone-36-inch-original-griddle-propane-" in status
++    assert withheld_save_status(agent).endswith("did not pass its source check.")
++    agent._generic_research_save_requested = False
++    assert save_verified_generic_research(agent, "answer") == "" and withheld_save_status(agent) == ""
++
++
++def test_finalizer_saves_verified_answer_and_reports_path(tmp_path, monkeypatch):
++    from agent.research_finalizer import seal_research_final
++
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(tmp_path))
++    agent = _agent()
++    assert arm_generic_research_route_for_turn(agent, SAVE_PROMPT, "turn-1") is True
++    messages = _messages(SAVE_PROMPT)
++    assert bind_generic_research_receipt(agent, URLS, messages) is True
++    answer = f"Four burners.\n\nSources:\n[1] {URLS[0]}\n[2] {URLS[1]}"
++    messages.append({"role": "assistant", "content": answer})
++    final_response, failed, reason, _finish = seal_research_final(
++        agent, final_response=answer, failed=False, messages=messages, _turn_exit_reason="text_response")
++    assert failed is False
++    assert "Saved to wiki: `research/blackstone-36-inch-original-griddle-propane-" in final_response
++    saved = list((tmp_path / "research").iterdir())
++    assert len(saved) == 1 and "Four burners." in saved[0].read_text()

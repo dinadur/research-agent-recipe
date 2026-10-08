@@ -1,0 +1,29 @@
+# Main lane engine: vLLM + MTP speculative decoding in a container, one GPU.
+# For the Intel Arc (XPU) EXL3 build, the image and serve.py recipe, see 0xSero's repositories:
+#   https://github.com/0xSero/qwen38-flash-next-b70-offload  and the ghcr.io/0xsero/exl3xpu image.
+# Pin the image by digest. Device nodes, model path and serve.py arguments below are placeholders.
+[Unit]
+Description=Main lane engine (vLLM + MTP, container)
+Requires=docker.service
+After=docker.service network-online.target
+RequiresMountsFor=/srv/models
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f llm-main-vllm
+ExecStart=/usr/bin/docker run --rm --pull never --name llm-main-vllm \
+  --device /dev/dri/card0 --device /dev/dri/renderD128 \
+  --network host --ipc private --shm-size 16g \
+  -e HF_HUB_OFFLINE=1 -e ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \
+  -v /srv/models/qwen3.8-27b-exl3-4.00bpw:/models:ro \
+  ghcr.io/0xsero/exl3xpu@sha256:<pinned-digest> \
+  <serve command from 0xSero's repo> --port 8260 --host 127.0.0.1 \
+  --enable-prefix-caching --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details
+ExecStop=/usr/bin/docker stop -t 60 llm-main-vllm
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,160 @@
+From e484689fbab470050d329c0b522f5fbec7b02009 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:54:53 +0000
+Subject: [PATCH 05/18] B70: short research-note titles, strip note preamble,
+ keep docs research on default budget
+
+- Research-note titles now drop conversational lead-ins ("I'd like to",
+  "Can you", "please"), the research verb and "the purchase of", use only
+  the first sentence and cap at 10 words ("3D printer around $1000").
+- The saved note (not the chat reply) drops a short model preamble such as
+  "Receipt bound - 2 sources admitted. Here's the brief:".
+- Fix from the regression run: requests that ask for primary or official
+  sources are never treated as open-ended, so targeted documentation
+  research keeps the default 3-search, 2-extract budget and immediate
+  receipt. "Current best practices" had matched the open-ended detector.
+  The 4 existing route tests that caught this now pass.
+
+Research regression suites: 630 passed, 2 skipped. User-authorized on
+2026-09-27.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/generic_research_publisher.py           | 45 ++++++++++++++++---
+ agent/generic_research_route.py               |  7 ++-
+ .../agent/test_generic_research_publisher.py  | 21 +++++++++
+ 3 files changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/agent/generic_research_publisher.py b/agent/generic_research_publisher.py
+index 42b112ac0..819e602ca 100644
+--- a/agent/generic_research_publisher.py
++++ b/agent/generic_research_publisher.py
+@@ -21,8 +21,27 @@ from typing import Any, Sequence
+ 
+ RESEARCH_DIRECTORY = "research"
+ MAX_SAME_DAY_NOTES = 20
+-_LEADING_VERB_RE = re.compile(r"^\s*(?:please\s+)?(?:research|investigate|look\s+up)\s+(?:the\s+|a\s+|an\s+)?", re.IGNORECASE)
++MAX_TITLE_WORDS = 10
++# Conversational lead-ins ("I'd like to", "Can you", "please") before the research verb (2026-09-27).
++_LEAD_IN_RE = re.compile(
++    r"^\s*(?:(?:hi|hey|hello)\b[,!.]?\s*)?(?:please\s+)?"
++    r"(?:(?:i['’]?d|i\s+would)\s+like\s+(?:you\s+)?to|i\s+(?:want|need)\s+(?:you\s+)?to|"
++    r"(?:can|could|would|will)\s+you(?:\s+please)?|help\s+me)\s+",
++    re.IGNORECASE,
++)
++_LEADING_VERB_RE = re.compile(
++    r"^\s*(?:please\s+)?(?:research|investigate|look\s+(?:up|into)|find\s+out\s+about)\s+(?:the\s+|a\s+|an\s+)?",
++    re.IGNORECASE,
++)
++_PURCHASE_RE = re.compile(r"^(?:the\s+)?(?:purchase|buying|choice)\s+of\s+(?:the\s+|a\s+|an\s+)?", re.IGNORECASE)
+ _SAVE_CLAUSE_RE = re.compile(r"[.;,]?\s*(?:and\s+)?(?:then\s+)?(?:save|add|write|publish|store|put)\b.*$", re.IGNORECASE | re.DOTALL)
++_FIRST_SENTENCE_RE = re.compile(r"(?<=[.?!])\s+")
++# A short model preamble before the article body ("Receipt bound - 2 sources admitted. Here's the brief:").
++_CHATTER_RE = re.compile(
++    r"^\s*(?:receipt[\s-]*(?:bound|sealed|captured|ready)\b|here['’]?s\b|here\s+is\b|below\s+is\b|"
++    r"(?:ok(?:ay)?|sure|alright|great|done)\b[,!.:]|sources?\s+(?:admitted|bound)\b)",
++    re.IGNORECASE,
++)
+ 
+ 
+ class GenericResearchPublicationError(RuntimeError):
+@@ -36,9 +55,15 @@ def _slugify(value: str) -> str:
+ 
+ 
+ def research_note_title(operator_prompt: str, response: str) -> str:
+-    """The research subject from the request (before any colon or save clause); else the answer's first heading."""
++    """The research subject from the request's first sentence (lead-ins, research verb, colon detail and save clause
++    removed; at most MAX_TITLE_WORDS words); else the answer's first heading."""
+     text = " ".join(str(operator_prompt or "").split())
+-    subject = _SAVE_CLAUSE_RE.sub("", _LEADING_VERB_RE.sub("", text, count=1)).split(":", 1)[0].strip(" .")
++    text = _LEADING_VERB_RE.sub("", _LEAD_IN_RE.sub("", text, count=1), count=1)
++    text = _FIRST_SENTENCE_RE.split(text, maxsplit=1)[0]
++    subject = _PURCHASE_RE.sub("", _SAVE_CLAUSE_RE.sub("", text).split(":", 1)[0]).strip(" .?!,")
++    words = subject.split()
++    if len(words) > MAX_TITLE_WORDS:
++        subject = " ".join(words[:MAX_TITLE_WORDS]).rstrip(",;:")
+     if len(_slugify(subject)) >= 4:
+         return subject[:120].strip()
+     for line in str(response or "").splitlines():
+@@ -48,6 +73,16 @@ def research_note_title(operator_prompt: str, response: str) -> str:
+     return "Research note"
+ 
+ 
++def strip_leading_chatter(response: str) -> str:
++    """Drop short model-preamble lines before the article body (saved note only; the chat reply keeps them)."""
++    lines = str(response or "").strip().splitlines()
++    while lines and len(lines[0]) <= 200 and _CHATTER_RE.search(lines[0]) and not lines[0].lstrip().startswith(("#", "-", "*", "|")):
++        lines.pop(0)
++        while lines and not lines[0].strip():
++            lines.pop(0)
++    return "\n".join(lines) if lines else str(response or "").strip()
++
++
+ def render_research_note(*, title: str, operator_prompt: str, response: str, sources: Sequence[str], session_id: str,
+                          today: dt.date) -> bytes:
+     source_list = [str(url) for url in sources]
+@@ -56,7 +91,7 @@ def render_research_note(*, title: str, operator_prompt: str, response: str, sou
+              f"request: {json.dumps(' '.join(str(operator_prompt).split()), ensure_ascii=False)}", "sources:"]
+     lines += [f"  - {json.dumps(url, ensure_ascii=False)}" for url in source_list]
+     lines += [f"receipt_sources_sha256: {hashlib.sha256(json.dumps(source_list).encode()).hexdigest()}", "---", "",
+-              f"# {title}", "", str(response).strip(), "",
++              f"# {title}", "", strip_leading_chatter(response), "",
+               f"*Saved by Hermes research on {today.isoformat()} from receipt-verified sources; unreviewed.*", ""]
+     return "\n".join(lines).encode("utf-8")
+ 
+@@ -134,4 +169,4 @@ def withheld_save_status(agent: Any) -> str:
+ 
+ 
+ __all__ = ["GenericResearchPublicationError", "publish_generic_research", "render_research_note",
+-           "research_note_title", "save_verified_generic_research", "withheld_save_status"]
++           "research_note_title", "save_verified_generic_research", "strip_leading_chatter", "withheld_save_status"]
+diff --git a/agent/generic_research_route.py b/agent/generic_research_route.py
+index ee5f03dee..e6b1a805a 100644
+--- a/agent/generic_research_route.py
++++ b/agent/generic_research_route.py
+@@ -546,7 +546,12 @@ def generic_research_broad_request(user_message: Any) -> bool:
+     if not isinstance(user_message, str):
+         return False
+     text = " ".join(user_message.split())
+-    return bool(_OPEN_ENDED_RE.search(text)) and not _comparison_alternatives(text)
++    # Targeted documentation research ("use primary/official sources") keeps the default budget.
++    return (
++        bool(_OPEN_ENDED_RE.search(text))
++        and not _comparison_alternatives(text)
++        and _PRIMARY_SOURCE_REQUEST_RE.search(text) is None
++    )
+ 
+ 
+ def _search_budget(agent: Any) -> int:
+diff --git a/tests/agent/test_generic_research_publisher.py b/tests/agent/test_generic_research_publisher.py
+index e3d292140..c251e0412 100644
+--- a/tests/agent/test_generic_research_publisher.py
++++ b/tests/agent/test_generic_research_publisher.py
+@@ -100,6 +100,27 @@ def test_title_falls_back_to_answer_heading():
+     assert research_note_title("Please research dew point: definition. Save to wiki.", "") == "dew point"
+ 
+ 
++def test_conversational_requests_get_short_titles():
++    original = ("I'd like to research the purchase of a 3D printer around $1000. I'm looking for something more open "
++                "source like the snapmaker U1 that I can work with an agent to print to via API/MCP.  Can you research "
++                "the best options and write a wiki article?")
++    assert research_note_title(original, "") == "3D printer around $1000"
++    assert research_note_title("Can you research heat pump water heaters and save it to the wiki?", "") == \
++        "heat pump water heaters"
++    assert research_note_title("Research the Snapmaker U1, Prusa Core One and Bambu Lab P1S: firmware. Save it as a "
++                               "wiki article.", "") == "Snapmaker U1, Prusa Core One and Bambu Lab P1S"
++    long = "Research " + " ".join(f"word{i}" for i in range(20)) + " and save it to the wiki"
++    assert len(research_note_title(long, "").split()) == 10
++
++
++def test_saved_note_drops_leading_model_chatter_only():
++    from agent.generic_research_publisher import strip_leading_chatter
++    body = "Receipt bound — 2 official Fellow sources admitted. Here's the brief:\n\n## Kettle\n- 1,200 W [1]"
++    assert strip_leading_chatter(body) == "## Kettle\n- 1,200 W [1]"
++    assert strip_leading_chatter("## Kettle\nHere's the brief: stays") == "## Kettle\nHere's the brief: stays"
++    assert strip_leading_chatter("The kettle heats in 3 minutes.") == "The kettle heats in 3 minutes."
++
++
+ def test_status_lines(tmp_path, monkeypatch):
+     agent = SimpleNamespace(_generic_research_save_requested=True, _generic_research_operator_prompt=SAVE_PROMPT,
+                             _generic_research_receipt_sources=tuple(URLS), session_id="session-1")

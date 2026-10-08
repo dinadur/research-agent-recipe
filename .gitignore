@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+testing/results/
+*.session
+*.session-journal
+*.env

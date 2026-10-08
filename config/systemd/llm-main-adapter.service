@@ -1,0 +1,20 @@
+[Unit]
+Description=Main lane adapter on 127.0.0.1:8242 (OpenAI-compatible front for vLLM)
+After=llm-main-vllm.service
+Wants=llm-main-vllm.service
+PartOf=llm-main-vllm.service
+
+[Service]
+User=llm
+Group=llm
+EnvironmentFile=/etc/research-agent/adapter.env
+ExecStart=/usr/bin/python3 -u /opt/research-agent/adapters/openai_vllm_adapter.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
