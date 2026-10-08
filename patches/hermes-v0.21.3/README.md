@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 25, in order, produced with `git format-patch`.
+- **Patches:** 26, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -67,6 +67,7 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0023 | Send a thin travel manifest back to discovery once | Before the turn's single controller attempt, a manifest below 8 candidates per category (16 total) is returned once while at least 4 searches remain; not a failure and not the controller boundary |
 | 0024 | Product route accepts polite lead-ins before "research" | "Can/could/would you (please)", "please", "I'd like you to", "help me" (and a leading hey/hi) before "research" select the product route |
 | 0025 | Route natural product, fact-check and travel phrasings | Natural shopping asks with a product signal (price, buying verb, model token or common product category) select the product route; look-into / find-out / verify / "is it true" asks select generic research; "heading to <place>" and "N days in" count as travel. `tests/agent/test_route_phrasing_corpus.py` holds 97 phrasings with expected routes. Needs receipt script v5 |
+| 0026 | Queue messages during research turns; deliver batched travel previews | While a travel, product or generic research turn runs, a new message is queued instead of steered or interrupting (/stop and /new still cancel); a travel preview is delivered when other tool calls are batched with the one controller call |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 

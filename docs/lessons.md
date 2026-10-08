@@ -181,3 +181,9 @@ through the chat front end, not by unit tests.
     pattern. After the route was widened, the first live fact-check turns were routed correctly and then rejected
     by the receipt script ("current turn is not a research request"). Change both in the same deploy, and test that
     every phrasing the runtime routes is accepted by the script.
+42. **A message sent mid-run hijacked a research turn** (0026). With `busy_input_mode: steer`, a product question sent
+    two minutes into a travel turn was injected into it. The model batched the travel controller with a product
+    search, the batched call fell outside the single-call preview check, and the user got a product answer from a
+    travel-locked session while the travel preview (a passing receipt) was dropped. Controller-bound turns now
+    queue new messages, and the preview check finds the controller among batched calls. Test busy-input handling
+    with a canary that sends a follow-up while a long turn runs.

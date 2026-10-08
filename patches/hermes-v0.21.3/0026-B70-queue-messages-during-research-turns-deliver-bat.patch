@@ -1,0 +1,326 @@
+From 92da30628cd004ed89e1e65d5fcbe520a5390cba Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 19:17:00 +0000
+Subject: [PATCH] B70: queue messages during research turns; deliver batched
+ travel previews
+
+On 2026-10-08 a product question sent two minutes into a Tucson travel turn
+was steered into it (busy_input_mode: steer). The model then batched the
+travel runner with a vacuum search and extract, and answered the vacuum
+question from the travel-locked session. The travel controller had passed and
+written a receipt, but its preview was never delivered.
+
+- Gateway: while the running turn is on the travel, product or generic
+  research route, steer and interrupt are demoted to queue, like the existing
+  subagent and compression demotions. /stop and /new still cancel. The busy
+  acknowledgement says the message is queued, and that a different request
+  needs /new once the run finishes.
+- Travel delivery: the approval preview and the controller boundary are found
+  when other tool calls are batched with the one controller call. The preview
+  is still hash-verified. Two controller calls in one batch are still
+  rejected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/verified_tool_delivery.py               | 40 +++++++++--
+ gateway/run.py                                |  1 +
+ gateway/run_busy.py                           | 39 +++++++++++
+ tests/agent/test_verified_tool_delivery.py    | 36 ++++++++++
+ .../gateway/test_busy_research_route_queue.py | 68 +++++++++++++++++++
+ 5 files changed, 177 insertions(+), 7 deletions(-)
+ create mode 100644 tests/gateway/test_busy_research_route_queue.py
+
+diff --git a/agent/verified_tool_delivery.py b/agent/verified_tool_delivery.py
+index 64cd6fd..1380e16 100644
+--- a/agent/verified_tool_delivery.py
++++ b/agent/verified_tool_delivery.py
+@@ -184,9 +184,16 @@ def _travel_controller_invocation(
+ ) -> tuple[Any, dict[str, Any], list[str]] | None:
+     """Return one exact travel controller/runner invocation, independent of output."""
+ 
+-    if len(tool_calls) != 1:
+-        return None
+-    tool_call = tool_calls[0]
++    # The model sometimes batches other calls with the controller (2026-10-08 Tucson:
++    # a steered product question added a search and an extract), which used to drop
++    # the hash-bound approval preview. Exactly one controller call is still required.
++    matches = [match for match in map(_single_travel_controller_invocation, tool_calls) if match is not None]
++    return matches[0] if len(matches) == 1 else None
++
++
++def _single_travel_controller_invocation(
++    tool_call: Any,
++) -> tuple[Any, dict[str, Any], list[str]] | None:
+     name, raw_arguments = _tool_name_and_arguments(tool_call)
+     if name != "terminal":
+         return None
+@@ -224,6 +231,21 @@ def _travel_controller_invocation(
+     return tool_call, arguments, command_tokens
+ 
+ 
++def _tool_result_for(
++    call_id: str, tool_result_messages: Sequence[Mapping[str, Any]]
++) -> Mapping[str, Any] | None:
++    """The single tool result answering ``call_id``, or None."""
++
++    if not call_id:
++        return None
++    found = [
++        message
++        for message in tool_result_messages
++        if isinstance(message, Mapping) and str(message.get("tool_call_id") or "") == call_id
++    ]
++    return found[0] if len(found) == 1 else None
++
++
+ def travel_research_controller_boundary(
+     tool_calls: Sequence[Any], tool_result_messages: Sequence[Mapping[str, Any]]
+ ) -> bool:
+@@ -235,11 +257,13 @@ def travel_research_controller_boundary(
+     """
+ 
+     invocation = _travel_controller_invocation(tool_calls)
+-    if invocation is None or len(tool_result_messages) != 1:
++    if invocation is None:
+         return False
+     tool_call, _arguments, _tokens = invocation
+-    message = tool_result_messages[0]
+     call_id = _tool_call_id(tool_call)
++    message = _tool_result_for(call_id, tool_result_messages)
++    if message is None:
++        return False
+     if isinstance(message, Mapping):
+         try:
+             payload = json.loads(str(message.get("content") or ""))
+@@ -519,14 +543,16 @@ def travel_research_approval_delivery(
+     """
+ 
+     invocation = _travel_controller_invocation(tool_calls)
+-    if invocation is None or len(tool_result_messages) != 1:
++    if invocation is None:
+         return None
+     tool_call, arguments, _command_tokens = invocation
+     if arguments.get("timeout") != TRAVEL_CONTROLLER_OUTER_TIMEOUT_SECONDS:
+         return None
+ 
+-    message = tool_result_messages[0]
+     call_id = _tool_call_id(tool_call)
++    message = _tool_result_for(call_id, tool_result_messages)
++    if message is None:
++        return None
+     if (
+         not isinstance(message, Mapping)
+         or message.get("role") != "tool"
+diff --git a/gateway/run.py b/gateway/run.py
+index e91aade..c2025d8 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3892,6 +3892,7 @@ class GatewayRunner(
+         demoted_for_compression: bool
+         steered: bool
+         redirected: bool
++        demoted_for_research: bool = False
+ 
+     # Worker bound for _cleanup_agent_resources: sync, can block long (subprocess teardown, memory IO).
+     _CLEANUP_TIMEOUT_S = 30.0
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+index 2688b95..8042fb2 100644
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -490,6 +490,18 @@ class GatewayBusySessionMixin:
+         )
+         if demoted_for_compression:
+             effective_mode = self._demote_interrupt(session_key, "context compression is in flight (#56391)")
++        # A research-route turn (travel, product, generic) is controller-bound: a steered
++        # message mid-run hijacked it (2026-10-08: a product question steered into a travel
++        # turn; the travel preview was never delivered). Queue instead; /stop and /new still cancel.
++        demoted_for_research = (
++            effective_mode in ("steer", "interrupt") and self._agent_on_research_route(running_agent)
++        )
++        if demoted_for_research:
++            logger.info(
++                "Demoting busy_input_mode %r to 'queue' for session %s because a research-route turn is running",
++                effective_mode, session_key,
++            )
++            effective_mode = "queue"
+         steered = redirected = False
+         agent_live = running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL
+         plain_text = (
+@@ -522,8 +534,28 @@ class GatewayBusySessionMixin:
+         return self._BusySteerOutcome(
+             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
+             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
++            demoted_for_research=demoted_for_research,
+         )
+ 
++    @staticmethod
++    def _agent_on_research_route(running_agent: Any) -> bool:
++        """Whether the running agent's turn belongs to a controller-bound research route."""
++        from gateway.run import _AGENT_PENDING_SENTINEL
++        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
++            return False
++        try:
++            from agent.generic_research_route import generic_research_route_active
++            from agent.product_route import product_research_route_active
++            from agent.travel_route import travel_publication_route_active
++            return any(
++                check(running_agent) is True
++                for check in (travel_publication_route_active, product_research_route_active,
++                              generic_research_route_active)
++            )
++        except Exception:
++            logger.debug("research-route busy check failed", exc_info=True)
++            return False
++
+     @staticmethod
+     def _demote_interrupt(session_key: str, why: str) -> str:
+         logger.info("Demoting busy_input_mode 'interrupt' to 'queue' for session %s because %s", session_key, why)
+@@ -582,6 +614,7 @@ class GatewayBusySessionMixin:
+         self, event: MessageEvent, now: float, _busy_state, running_agent: Any, *,
+         is_steer_mode: bool, is_queue_mode: bool, is_redirect_mode: bool,
+         demoted_for_subagents: bool, demoted_for_compression: bool,
++        demoted_for_research: bool = False,
+     ) -> str:
+         from gateway.run import (
+             _AGENT_PENDING_SENTINEL, _hermes_home, _load_gateway_config, _platform_config_key
+@@ -624,6 +657,11 @@ class GatewayBusySessionMixin:
+             head, tail = "⏳ Subagent working", self._BUSY_DEMOTED_TAIL
+         elif is_queue_mode and demoted_for_compression:
+             head, tail = "⏳ Compressing context", self._BUSY_DEMOTED_TAIL
++        elif is_queue_mode and demoted_for_research:
++            head, tail = "⏳ Research run in progress", (
++                ". Your message is queued until it finishes. This session stays on that research, "
++                "so for a different request send /new after the result arrives (/stop cancels the run)."
++            )
+         elif is_queue_mode:
+             head, tail = "⏳ Queued for the next turn", ". I'll respond once the current task finishes."
+         else:
+@@ -748,6 +786,7 @@ class GatewayBusySessionMixin:
+             is_queue_mode=is_queue_mode, is_redirect_mode=is_redirect_mode,
+             demoted_for_subagents=_steer.demoted_for_subagents,
+             demoted_for_compression=_steer.demoted_for_compression,
++            demoted_for_research=_steer.demoted_for_research,
+         )
+         await self._send_busy_ack_reply(event, adapter, message)
+         return True
+diff --git a/tests/agent/test_verified_tool_delivery.py b/tests/agent/test_verified_tool_delivery.py
+index a06d51c..d2053ee 100644
+--- a/tests/agent/test_verified_tool_delivery.py
++++ b/tests/agent/test_verified_tool_delivery.py
+@@ -322,3 +322,39 @@ def test_travel_approval_delivery_rejects_wrong_invocation_and_mutation():
+         [tool_call(command=travel_command(), timeout=900)],
+         [terminal_message(repeated)],
+     ) is None
++
++
++def _other_call(call_id: str, name: str = "web_search"):
++    return SimpleNamespace(
++        id=call_id, function=SimpleNamespace(name=name, arguments=json.dumps({"query": "robot vacuum"}))
++    )
++
++
++def _other_result(call_id: str, name: str = "web_search"):
++    return {"role": "tool", "name": name, "tool_call_id": call_id, "content": "search results"}
++
++
++def test_travel_preview_is_delivered_when_other_calls_are_batched_with_the_controller():
++    # 2026-10-08 Tucson: a steered question made the model batch a search and an
++    # extract with the runner, and the hash-bound preview was dropped.
++    call = tool_call(command=travel_runner_command(), timeout=900)
++    calls = [_other_call("call-a"), call, _other_call("call-b", "web_extract")]
++    results = [_other_result("call-a"), terminal_message(travel_output()), _other_result("call-b", "web_extract")]
++    assert travel_research_approval_delivery(calls, results) == (travel_approval(), False)
++    assert travel_research_controller_boundary(calls, results) is True
++
++
++def test_batched_controller_without_a_valid_envelope_is_still_a_boundary():
++    call = tool_call(command=travel_runner_command(), timeout=900)
++    calls = [_other_call("call-a"), call]
++    results = [_other_result("call-a"), terminal_message("no envelope")]
++    assert travel_research_approval_delivery(calls, results) is None
++    assert travel_research_controller_boundary(calls, results) is True
++
++
++def test_two_controller_calls_in_one_batch_are_not_delivered():
++    first = tool_call(command=travel_runner_command(), timeout=900)
++    second = SimpleNamespace(id="call-second", function=first.function)
++    results = [terminal_message(travel_output()), dict(terminal_message(travel_output()), tool_call_id="call-second")]
++    assert travel_research_approval_delivery([first, second], results) is None
++    assert travel_research_controller_boundary([first, second], results) is False
+diff --git a/tests/gateway/test_busy_research_route_queue.py b/tests/gateway/test_busy_research_route_queue.py
+new file mode 100644
+index 0000000..f6a4302
+--- /dev/null
++++ b/tests/gateway/test_busy_research_route_queue.py
+@@ -0,0 +1,68 @@
++"""A message sent while a research-route turn runs is queued, not steered (2026-10-08)."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform
++from gateway.platforms.event import MessageEvent
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++def _source():
++    return SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1", chat_type="dm")
++
++
++class Receiver:
++    _supports_active_turn_redirect = True
++
++    def __init__(self, **attributes):
++        self.payload = None
++        self.session_id = "session-1"
++        self._current_turn_id = "turn-1"
++        for key, value in attributes.items():
++            setattr(self, key, value)
++
++    def steer(self, text):
++        self.payload = text
++        return True
++
++    redirect = steer
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["steer", "interrupt"])
++async def test_travel_turn_queues_instead_of_steering(mode, tmp_path, monkeypatch):
++    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
++    runner = GatewayRunner(config=GatewayConfig())
++    receiver = Receiver(_travel_publication_route_turn_id="turn-1")
++    runner._session_state("key").turn.agent = receiver
++    event = MessageEvent(text="What's the best robot vacuum under $400?", source=_source(), message_id="m")
++
++    outcome = await runner._resolve_busy_steer_or_redirect(event, "key", mode, receiver)
++
++    assert outcome.effective_mode == "queue"
++    assert outcome.demoted_for_research is True
++    assert outcome.steered is False and outcome.redirected is False
++    assert receiver.payload is None
++
++
++@pytest.mark.asyncio
++async def test_ordinary_turn_still_steers(tmp_path, monkeypatch):
++    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
++    runner = GatewayRunner(config=GatewayConfig())
++    receiver = Receiver()
++    runner._session_state("key").turn.agent = receiver
++    event = MessageEvent(text="also mention the price", source=_source(), message_id="m")
++
++    outcome = await runner._resolve_busy_steer_or_redirect(event, "key", "steer", receiver)
++
++    assert outcome.steered is True
++    assert outcome.demoted_for_research is False
++    assert receiver.payload.endswith("also mention the price")
++
++
++def test_research_route_check_tolerates_missing_agent():
++    assert GatewayRunner._agent_on_research_route(None) is False
++    assert GatewayRunner._agent_on_research_route(SimpleNamespace()) is False
+-- 
+2.53.0
+
