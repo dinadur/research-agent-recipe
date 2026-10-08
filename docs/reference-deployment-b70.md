@@ -76,6 +76,8 @@ your exact build.
 
 ### Judge lane: Clef-Flash
 
+Model: [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash), converted to GGUF with llama.cpp's `convert_hf_to_gguf.py` and quantized to Q4_K_M.
+
 llama-server with `-c 2048 -np 1 -b 1024 -ub 1024 -ngl 99`, behind the Clef adapter at threshold 0.85. Latency p50
 was 0.54 s on the offline set, and about 0.4-1.0 s per claim live.
 

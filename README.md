@@ -36,7 +36,7 @@ routed to a controller, not left to the model's judgement:
    then is withheld.
 5. **Withholding.** If any step fails, the user gets a short "withheld" message instead of an unsupported answer.
 
-A separate small model (Clef-Flash) judges, sentence by sentence, whether delivered claims are supported by the
+A separate small model ([Clef-Flash](https://huggingface.co/Cloudflare/clef-flash), by Cloudflare) judges, sentence by sentence, whether delivered claims are supported by the
 cited pages. It runs **log-only**: in blind grading it was not reliable enough to show users (see below).
 
 ## Architecture at a glance

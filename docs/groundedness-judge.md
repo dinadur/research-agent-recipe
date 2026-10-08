@@ -26,6 +26,10 @@ Both read `product_research.groundedness_judge` from the Hermes config (`enabled
 
 ## The Clef-Flash adapter
 
+The model is Cloudflare's [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) (a 9B decision model). The reference deployment converted it to GGUF with
+llama.cpp's `convert_hf_to_gguf.py` (v0.6.0 tree) and quantized it to Q4_K_M (5.7 GB); Q8_0 needs about 10 GB of
+VRAM and gave the same decisions in testing.
+
 Hermes speaks the Granite Guardian chat format:
 
 ```
