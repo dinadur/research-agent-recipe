@@ -160,7 +160,7 @@ Over both rounds, 151 claims were judged:
 If a user-facing check is ever wanted, the realistic route is:
 
 1. split compound claims into atomic facts;
-2. give the judge a larger context and batch, which needs VRAM that the reference judge card did not have;
+2. give the judge a larger context and batch (the reference judge card has about 14 GB free, so this fits);
 3. re-grade a fresh sample;
 4. add a visible marker only if true factual catches show up at a useful rate.
 
