@@ -1,0 +1,321 @@
+From a0beeb8bf04e7dfc4f607c5d83327bffa3616ed2 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 19:40:53 +0000
+Subject: [PATCH 28/28] B70: a different research request starts a new session
+
+Travel and product sessions latch their capability for the life of the
+session. A different research request sent into one was refused ("send
+/new"). A queued product question after a travel run was withheld
+(2026-10-08 Tucson).
+
+- Idle message: before the session is claimed, a research request whose route
+  differs from the session's latched travel or product route is moved to a
+  fresh session. A new product request in a product session counts too. The
+  move uses the /new handler, and the chat gets "Started a new session ...
+  /resume <previous id>". Approvals, "more" and other continuations stay.
+  Ordinary messages return synchronously, so the session claim still happens
+  before the handler first yields.
+- Queued message: a queued follow-up that is such a request is not run in the
+  finishing session. It is re-dispatched through the adapter once the run
+  releases, and the idle path then moves it to a new session.
+- The busy acknowledgement says a different request will start in a new
+  session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_session_switch.py              | 64 +++++++++++++++++++
+ gateway/run_busy.py                           |  4 +-
+ gateway/run_inbound.py                        | 52 +++++++++++++++
+ gateway/run_turn.py                           | 18 ++++++
+ tests/agent/test_research_session_switch.py   | 32 ++++++++++
+ .../test_research_session_switch_gateway.py   | 54 ++++++++++++++++
+ 6 files changed, 222 insertions(+), 2 deletions(-)
+ create mode 100644 agent/research_session_switch.py
+ create mode 100644 tests/agent/test_research_session_switch.py
+ create mode 100644 tests/gateway/test_research_session_switch_gateway.py
+
+diff --git a/agent/research_session_switch.py b/agent/research_session_switch.py
+new file mode 100644
+index 0000000..f0440c5
+--- /dev/null
++++ b/agent/research_session_switch.py
+@@ -0,0 +1,64 @@
++"""Start a fresh session when a research-locked session receives a different request.
++
++Travel and product sessions latch their narrow capability for the life of the
++session, so approvals and "more" replies keep working. A different research
++request sent into such a session used to be refused ("send /new") or, for a
++queued product question after a travel run, withheld (2026-10-08). The gateway
++asks this module whether to rotate the session first; continuations stay put.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++
++def message_requests_research(message: Any) -> bool:
++    """Cheap pre-check: does the message select any research route on its own?"""
++
++    if not isinstance(message, str) or not message.strip() or message.lstrip().startswith("/"):
++        return False
++    from agent.generic_research_route import requires_generic_research_route
++    from agent.product_route import requires_product_research_route
++    from agent.travel_route import requires_travel_publication_route
++
++    return bool(
++        requires_travel_publication_route(message)
++        or requires_product_research_route(message)
++        or requires_generic_research_route(message)
++    )
++
++
++def research_session_switch_reason(conversation_history: Any, message: Any) -> str | None:
++    """Why ``message`` should start a new session, or None to stay in this one."""
++
++    if not isinstance(message, str) or not message.strip() or message.lstrip().startswith("/"):
++        return None
++    from agent.generic_research_route import requires_generic_research_route
++    from agent.product_route import (
++        _history_requests_product_research,
++        product_publication_approval_requested,
++        requires_product_research_route,
++    )
++    from agent.travel_route import (
++        _history_requests_travel_publication,
++        requires_travel_publication_route,
++    )
++
++    travel_session = _history_requests_travel_publication(conversation_history)
++    product_session = _history_requests_product_research(conversation_history)
++    if not (travel_session or product_session):
++        return None
++    wants_travel = requires_travel_publication_route(message)
++    wants_product = not wants_travel and requires_product_research_route(message)
++    wants_generic = not (wants_travel or wants_product) and requires_generic_research_route(message)
++    if travel_session and (wants_product or wants_generic):
++        return "travel session received a %s research request" % ("product" if wants_product else "generic")
++    if product_session and (wants_travel or wants_generic):
++        return "product session received a %s research request" % ("travel" if wants_travel else "generic")
++    if product_session and wants_product and not product_publication_approval_requested(message):
++        # A product session holds one research request and its approval.
++        return "product session received a new product research request"
++    return None
++
++
++__all__ = ["message_requests_research", "research_session_switch_reason"]
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+index 8042fb2..9a21195 100644
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -659,8 +659,8 @@ class GatewayBusySessionMixin:
+             head, tail = "⏳ Compressing context", self._BUSY_DEMOTED_TAIL
+         elif is_queue_mode and demoted_for_research:
+             head, tail = "⏳ Research run in progress", (
+-                ". Your message is queued until it finishes. This session stays on that research, "
+-                "so for a different request send /new after the result arrives (/stop cancels the run)."
++                ". Your message is queued until it finishes; a different research request then starts "
++                "in a new session (/stop cancels the run)."
+             )
+         elif is_queue_mode:
+             head, tail = "⏳ Queued for the next turn", ". I'll respond once the current task finishes."
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 723834a..b3fe73b 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1187,6 +1187,53 @@ class GatewayInboundMixin:
+             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
+             return event, source, is_internal
+ 
++    async def _maybe_start_new_research_session(self, event: MessageEvent, source, session_key: str) -> bool:
++        """Rotate to a new session when a research-locked session gets a different request."""
++        try:
++            if event.is_command():
++                return False
++            entry = self.session_store._entries.get(session_key)
++            if entry is None or not getattr(entry, "session_id", None):
++                return False
++            from agent.research_session_switch import message_requests_research, research_session_switch_reason
++            # No await on the common path: the session must be claimed before this handler first
++            # yields (see the sentinel below), so ordinary messages return here synchronously and
++            # only research requests read the transcript.
++            if not message_requests_research(event.text or ""):
++                return False
++            history = self.session_store.load_transcript(entry.session_id)
++            reason = research_session_switch_reason(history, event.text or "")
++            if reason is None:
++                return False
++            old_session_id = entry.session_id
++            logger.info("Starting a new session for %s: %s (previous session %s)", session_key, reason, old_session_id)
++            await self._handle_reset_command(
++                MessageEvent(text="/new", source=source, message_id=event.message_id)
++            )
++            adapter = self._adapter_for_source(source)
++            if adapter is not None:
++                await self._send_busy_ack_reply(
++                    event, adapter,
++                    "🆕 Started a new session for this request. The previous research stays available "
++                    f"with /resume {old_session_id}",
++                )
++            return True
++        except Exception:
++            logger.warning("Research session switch check failed for %s", session_key, exc_info=True)
++            return False
++
++    async def _redispatch_after_release(self, adapter, pending_event: MessageEvent, session_key: str) -> None:
++        """Hand a queued message back to the adapter once the current run has released the session."""
++        for _ in range(240):
++            if session_key not in getattr(adapter, "_active_sessions", {}):
++                break
++            await asyncio.sleep(0.5)
++        else:
++            logger.warning("Queued research request for %s not redispatched: session still active", session_key)
++            return
++        pending_event._b70_research_redispatch = True
++        await adapter.handle_message(pending_event)
++
+     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+         """Handle an incoming message from any platform: auth → command check → running-agent
+         interrupt → get/create session → build context → run agent → return response."""
+@@ -1250,6 +1297,11 @@ class GatewayInboundMixin:
+                     "please resend shortly."
+                 )
+ 
++        # A different research request sent into a travel/product-locked session starts a fresh
++        # session first (2026-10-08); approvals and other continuations stay in the session.
++        if not is_internal or getattr(event, "_b70_research_redispatch", False):
++            await self._maybe_start_new_research_session(event, source, _quick_key)
++
+         # Claim this session before any await: many awaits sit between here and _run_agent
+         # registering the real AIAgent; without this sentinel a second message during any of them
+         # passes the "already running" guard and spins up a duplicate agent for the same session.
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 80eeba5..dd376c8 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -3469,6 +3469,24 @@ class GatewayTurnMixin:
+                 if pending:
+                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+ 
++        # A queued message that is a different research request than this locked session's route
++        # runs in a fresh session instead: re-dispatch it once this run releases (2026-10-08).
++        if pending_event is not None and pending and session_key and adapter is not None:
++            with suppress(Exception):
++                entry = self.session_store._entries.get(session_key)
++                if entry is not None and getattr(entry, "session_id", None):
++                    from agent.research_session_switch import message_requests_research, research_session_switch_reason
++                    history = (
++                        await asyncio.to_thread(self.session_store.load_transcript, entry.session_id)
++                        if message_requests_research(pending) else []
++                    )
++                    if research_session_switch_reason(history, pending) is not None:
++                        logger.info("Queued message for %s is a different research request; re-dispatching "
++                                    "it to a new session after this run", session_key)
++                        asyncio.create_task(self._redispatch_after_release(adapter, pending_event, session_key))
++                        pending_event = None
++                        pending = None
++
+         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
+         if result and not pending and not pending_event and result.get("pending_steer"):
+             pending = result.get("pending_steer")
+diff --git a/tests/agent/test_research_session_switch.py b/tests/agent/test_research_session_switch.py
+new file mode 100644
+index 0000000..d4c078a
+--- /dev/null
++++ b/tests/agent/test_research_session_switch.py
+@@ -0,0 +1,32 @@
++from agent.research_session_switch import research_session_switch_reason
++
++TRAVEL = [{"role": "user", "content": "Research a weekend trip to Tucson, Arizona: find verified attractions and restaurants and add them to my travel wiki."},
++          {"role": "assistant", "content": "Research is ready for review: Tucson, Arizona ..."}]
++PRODUCT = [{"role": "user", "content": "What's the best robot vacuum under $400 for pet hair?"},
++           {"role": "assistant", "content": "Recommendation: ..."}]
++CHAT = [{"role": "user", "content": "Write me a haiku about autumn"}, {"role": "assistant", "content": "..."}]
++
++
++def test_travel_session_rotates_for_product_and_generic_requests():
++    assert research_session_switch_reason(TRAVEL, "What's the best robot vacuum under $400 for pet hair?")
++    assert research_session_switch_reason(TRAVEL, "Is it true that honey never spoils?")
++
++
++def test_travel_session_keeps_continuations_and_new_destinations():
++    for message in ("yes", "more", "publish it", "Thanks!", "Research a long weekend in Sedona for my travel wiki"):
++        assert research_session_switch_reason(TRAVEL, message) is None
++
++
++def test_product_session_rotates_for_new_requests_but_keeps_approval():
++    assert research_session_switch_reason(PRODUCT, "Find me a good standing desk under $500")
++    assert research_session_switch_reason(PRODUCT, "Plan a weekend in Asheville with restaurants and things to do")
++    assert research_session_switch_reason(PRODUCT, "Can you look into whether the Fed raised rates this month?")
++    assert research_session_switch_reason(PRODUCT, "yes, publish it") is None
++    assert research_session_switch_reason(PRODUCT, "thanks, that helps") is None
++
++
++def test_ordinary_sessions_and_commands_never_rotate():
++    assert research_session_switch_reason(CHAT, "What's the best robot vacuum under $400 for pet hair?") is None
++    assert research_session_switch_reason([], "Find me a good standing desk under $500") is None
++    assert research_session_switch_reason(TRAVEL, "/new") is None
++    assert research_session_switch_reason(TRAVEL, "") is None
+diff --git a/tests/gateway/test_research_session_switch_gateway.py b/tests/gateway/test_research_session_switch_gateway.py
+new file mode 100644
+index 0000000..b10adca
+--- /dev/null
++++ b/tests/gateway/test_research_session_switch_gateway.py
+@@ -0,0 +1,54 @@
++"""The gateway starts a new session before a different research request in a locked session."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform
++from gateway.platforms.event import MessageEvent
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++TRAVEL = [{"role": "user", "content": "Research a weekend trip to Tucson, Arizona: find verified attractions and restaurants and add them to my travel wiki."}]
++
++
++def _runner(tmp_path, monkeypatch, history):
++    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
++    runner = GatewayRunner(config=GatewayConfig())
++    runner.session_store._entries["key"] = SimpleNamespace(session_id="old-session")
++    monkeypatch.setattr(runner.session_store, "load_transcript", lambda session_id: history)
++    calls = {"reset": [], "sent": []}
++
++    async def fake_reset(event):
++        calls["reset"].append(event.text)
++        return "reset"
++
++    async def fake_send(event, adapter, message):
++        calls["sent"].append(message)
++
++    runner._handle_reset_command = fake_reset
++    runner._send_busy_ack_reply = fake_send
++    runner._adapter_for_source = lambda source: object()
++    return runner, calls
++
++
++def _event(text):
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1", chat_type="dm")
++    return MessageEvent(text=text, source=source, message_id="m"), source
++
++
++@pytest.mark.asyncio
++async def test_product_request_in_travel_session_starts_a_new_session(tmp_path, monkeypatch):
++    runner, calls = _runner(tmp_path, monkeypatch, TRAVEL)
++    event, source = _event("What's the best robot vacuum under $400 for pet hair?")
++    assert await runner._maybe_start_new_research_session(event, source, "key") is True
++    assert calls["reset"] == ["/new"]
++    assert "/resume old-session" in calls["sent"][0]
++
++
++@pytest.mark.asyncio
++async def test_approval_in_travel_session_stays(tmp_path, monkeypatch):
++    runner, calls = _runner(tmp_path, monkeypatch, TRAVEL)
++    event, source = _event("yes")
++    assert await runner._maybe_start_new_research_session(event, source, "key") is False
++    assert calls["reset"] == [] and calls["sent"] == []
+-- 
+2.53.0
+

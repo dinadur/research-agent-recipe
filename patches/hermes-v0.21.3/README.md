@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 26, in order, produced with `git format-patch`.
+- **Patches:** 28, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -68,6 +68,8 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0024 | Product route accepts polite lead-ins before "research" | "Can/could/would you (please)", "please", "I'd like you to", "help me" (and a leading hey/hi) before "research" select the product route |
 | 0025 | Route natural product, fact-check and travel phrasings | Natural shopping asks with a product signal (price, buying verb, model token or common product category) select the product route; look-into / find-out / verify / "is it true" asks select generic research; "heading to <place>" and "N days in" count as travel. `tests/agent/test_route_phrasing_corpus.py` holds 97 phrasings with expected routes. Needs receipt script v5 |
 | 0026 | Queue messages during research turns; deliver batched travel previews | While a travel, product or generic research turn runs, a new message is queued instead of steered or interrupting (/stop and /new still cancel); a travel preview is delivered when other tool calls are batched with the one controller call |
+| 0027 | Product answers in plain language, 400-800 words | The quality-first synthesis prompt forbids internal words (packet, rows, controller, "the supplied evidence"), names sources by publisher, and targets 400-800 words (max 1,200) |
+| 0028 | A different research request starts a new session | In a travel- or product-locked session, a research request for another route (or a new product request) moves to a fresh session, idle or queued, with a /resume hint; continuations and approvals stay |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 

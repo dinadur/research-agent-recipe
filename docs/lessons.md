@@ -187,3 +187,11 @@ through the chat front end, not by unit tests.
     travel-locked session while the travel preview (a passing receipt) was dropped. Controller-bound turns now
     queue new messages, and the preview check finds the controller among batched calls. Test busy-input handling
     with a canary that sends a follow-up while a long turn runs.
+43. **Answers repeated the prompt's internal vocabulary** (0027). The synthesis prompt called the evidence a "packet"
+    and said "use only the supplied evidence", and 17 of 20 answers told the user about "the supplied evidence".
+    Say in the prompt who the reader is and which words are internal. Answers went from 6.7-9.4k characters in
+    three Telegram messages to 450-520 words in one, with no jargon.
+44. **Locked sessions need an exit** (0028). Route-locked sessions keep approvals safe, but a different request sent
+    into one was refused or withheld. Rotate to a new session for a different research request, keep
+    continuations in place, and tell the user how to /resume the old one. The rotation check must not add an await
+    before the gateway claims the session: a race-guard test caught that.

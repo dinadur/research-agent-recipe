@@ -1,0 +1,41 @@
+From ae618e8d73b3d082b51351453c5cda7c5acd3c51 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 19:40:53 +0000
+Subject: [PATCH 27/28] B70: product answers in plain language, 400-800 words
+
+Product answers echoed the synthesis prompt's internal vocabulary: 17 of 20
+answers in the 2026-10-08 02:20 run said "the supplied evidence", "the
+packet" or "the provided material". They ran 3,000-12,000 characters under a
+2,000-word cap. The quality-first system prompt now tells the model to write
+for the person who asked, never mention the packet, rows, controller or
+pipeline, refer to sources by publisher or page, and aim for 400-800 words
+(never more than 1,200), with one short paragraph or list per option.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/quality_first_route.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/agent/quality_first_route.py b/agent/quality_first_route.py
+index a8ec5f0..700b97a 100644
+--- a/agent/quality_first_route.py
++++ b/agent/quality_first_route.py
+@@ -217,7 +217,14 @@ historical price cannot pass a hard current-price cap.
+ Give the conclusion first. Explain material uncertainty and evidence gaps. Cite every
+ factual paragraph with normal Markdown links using only the exact allowed URLs. Never
+ emit a tool call, receipt command, publication claim, or hidden process commentary.
+-Return a finished answer of at most 2,000 words."""
++
++Write for the person who asked, in plain language. The evidence packet, its rows, the
++controller and the pipeline are internal: never mention them, and never write phrases
++such as "the supplied evidence", "the provided evidence", "the packet" or "the provided
++material". Refer to sources by publisher or page instead ("Hisense's product page",
++"RTINGS' review", "the sources I found"). Keep it tight: aim for 400-800 words, never
++more than 1,200, with one short paragraph or bullet list per option and no repeated
++caveats."""
+ 
+ 
+ def synthesis_messages(
+-- 
+2.53.0
+
