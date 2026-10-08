@@ -1,0 +1,35 @@
+From d4c70501b337f6fbbfa74f7e874b25fd7d1ec17f Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:56:47 +0000
+Subject: [PATCH 22/22] B70: travel controller v4 pin (schema-enforced review
+ chunks)
+
+ACCEPTED_TRAVEL_CONTROLLER_SHA256 -> 49bda376. Controller v4 sends each
+semantic-review chunk with a strict json_schema response_format: exactly
+record_id, claim_id, verdict and rationale, the verdict enum, the chunk's own
+identifiers and its exact item count. json_object only guaranteed syntax; on
+2026-10-08 a review still came back with the key ", " instead of verdict.
+The v3 salvage and split retry stay as the backstop. A replay of 22 archived
+review chunks was 22/22 valid on both v3 and v4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_harness/travel_runner.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/agent/research_harness/travel_runner.py b/agent/research_harness/travel_runner.py
+index aeba8a0..274e8c6 100644
+--- a/agent/research_harness/travel_runner.py
++++ b/agent/research_harness/travel_runner.py
+@@ -28,7 +28,7 @@ from hermes_constants import get_hermes_home
+ 
+ ACCEPTED_TRAVEL_SKILL_VERSION = "2.9.0"
+ ACCEPTED_TRAVEL_CONTROLLER_SHA256 = (
+-    "1cd021b33a066b277d223ab91f91332130dc1db28da82a2adb3ef25ac0d9c16a"
++    "49bda3760705028a83d80cd54a47bcde8106025ac29017d1fe995be6d4498253"
+ )
+ RUNNER_CONTROLLER_TIMEOUT_SECONDS = 870
+ _VERSION_RE = re.compile(r"^version:\s*([^\s#]+)\s*$", re.MULTILINE)
+-- 
+2.53.0
+

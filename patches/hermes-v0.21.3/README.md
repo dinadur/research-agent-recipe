@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 20, in order, produced with `git format-patch`.
+- **Patches:** 22, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -31,7 +31,7 @@ Results on the published series:
 - that subset: 61 passed;
 - a wider research selection (13 test files, including product route, generic route, research contract, travel route
   and verified delivery): 511 passed, 2 skipped, 1 failed (0001-0018);
-- after 0019-0020, every test file matching product_route, generic_research, research_contract, travel_route,
+- after 0019-0022, every test file matching product_route, generic_research, research_contract, travel_route,
   verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files): 483 passed,
   1 skipped, with a pinned controller copy present.
 
@@ -62,6 +62,8 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0018 | Spend an unused repair extraction instead of a premature receipt | In a granted repair round, a receipt call before the granted extraction is rewritten into that extraction |
 | 0019 | Travel previews sent once; travel search ceiling 24 | The approval preview is delivered only by the gateway's final send (it was also streamed, so chat showed it twice); the travel search ceiling rises from 12 to 24 so the route can reach its own 16-candidate target |
 | 0020 | Travel controller pin; one delivery-error message; fresh run directory on reruns | Moves the controller pin to the reference deployment's controller v3 (set it to your own controller's sha256); the delivery-error message is no longer streamed as well; a reused, non-empty run directory moves to a new `<name>-rerun-N` sibling instead of spending the turn's one controller attempt |
+| 0021 | Run the versioned travel runner from the deployed checkout | Admission binds the runner's working directory to the checkout Hermes runs from; the model sometimes chose an older checkout, which ran an older runner |
+| 0022 | Travel controller v4 pin (schema-enforced review chunks) | Moves the pin to the reference controller v4, which sends review chunks with a strict `json_schema` response format (set it to your own controller's sha256) |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 

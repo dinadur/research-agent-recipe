@@ -151,3 +151,11 @@ through the chat front end, not by unit tests.
     controller whose sha256 does not match its pin. Install the controller and move the pin in one step, keep the old
     controller beside it, and check `python3 -m agent.research_harness.travel_runner --verify-pin` from every
     checkout the runner may be started from before sending traffic.
+35. **The fix ran from the wrong checkout** (0021). `python3 -m <runner>` imports from the working directory, and the
+    model sometimes passed an older Hermes checkout as `workdir`, so a rerun still hit the old run-directory error.
+    Admission now binds the working directory to the deployed checkout. With it, an identical rerun moved to
+    `<name>-rerun-2` and delivered (11 verified).
+36. **`json_object` guarantees syntax, not shape** (0022). A reviewer reply used the key `", "` instead of `verdict`.
+    vLLM enforces a strict `json_schema` response format (a test schema forced an unnatural required key), so the
+    reference controller v4 sends each review chunk with a schema for its exact keys, verdict values, identifiers
+    and item count. Salvage of valid entries stays as a backstop.

@@ -1,0 +1,70 @@
+From 8cd2d05fc89dca2f2447678468037f2fde0ee4aa Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:43:38 +0000
+Subject: [PATCH 21/22] B70: run the versioned travel runner from the deployed
+ checkout
+
+"python3 -m agent.research_harness.travel_runner" imports the runner from the
+terminal's working directory. The model sometimes passes an older Hermes
+checkout as workdir. On the 2026-10-08 Savannah rerun it did, ran a runner
+without the fresh-run_dir fix, and lost the turn to "run_dir must be new or
+empty". Admission now binds workdir to the checkout research_contract.py was
+imported from, next to the 900-second timeout it already binds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_contract.py       | 9 +++++++++
+ tests/agent/test_travel_route.py | 5 +++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/agent/research_contract.py b/agent/research_contract.py
+index a89c5b3..21d0cee 100644
+--- a/agent/research_contract.py
++++ b/agent/research_contract.py
+@@ -262,6 +262,9 @@ _TRAVEL_PARTIAL_SEARCH_TOLERABLE_CODES = frozenset({"serpapi_unavailable"})
+ TRAVEL_CONTROLLER_ATTEMPT_LIMIT = 1
+ TRAVEL_CONTROLLER_OUTER_TIMEOUT_SECONDS = 900
+ TRAVEL_RUNNER_MODULE = "agent.research_harness.travel_runner"
++# The checkout this module was imported from: the deployed Hermes tree. The
++# versioned travel runner always runs from here (see before_agent_tool_call).
++DEPLOYED_HERMES_ROOT = Path(__file__).resolve().parent.parent
+ 
+ 
+ def _travel_raw_root() -> Path:
+@@ -5214,6 +5217,12 @@ def before_agent_tool_call(
+                 # chunk, while each individual model request remains capped by
+                 # the controller's own --timeout (600 seconds by default).
+                 args["timeout"] = TRAVEL_CONTROLLER_OUTER_TIMEOUT_SECONDS
++                # "python3 -m <runner>" imports the runner from its working
++                # directory. The model sometimes chose an older checkout as
++                # workdir (2026-10-08 Savannah rerun), which ran a runner without
++                # the current fixes, so bind the deployed tree.
++                if " -m " + TRAVEL_RUNNER_MODULE + " " in f" {args.get('command', '')} ":
++                    args["workdir"] = str(DEPLOYED_HERMES_ROOT)
+             mutation_reason = _travel_route_terminal_mutation_reason(args)
+             if mutation_reason is not None:
+                 return ResearchContractDecision(
+diff --git a/tests/agent/test_travel_route.py b/tests/agent/test_travel_route.py
+index b184115..e967306 100644
+--- a/tests/agent/test_travel_route.py
++++ b/tests/agent/test_travel_route.py
+@@ -736,11 +736,16 @@ def test_travel_turn_admits_versioned_runner_as_the_single_controller_attempt(
+             f"{request}"
+         ),
+         "timeout": 30,
++        "workdir": "/home/someone/older-hermes-checkout",
+     }
+ 
+     assert before_agent_tool_call(agent, "terminal", args) is None
+     assert args["timeout"] == 900
+     assert agent._travel_controller_attempt_count == 1
++    from agent.research_contract import DEPLOYED_HERMES_ROOT
++
++    assert args["workdir"] == str(DEPLOYED_HERMES_ROOT)
++    assert (DEPLOYED_HERMES_ROOT / "agent/research_harness/travel_runner.py").is_file()
+ 
+     blocked = before_agent_tool_call(
+         agent,
+-- 
+2.53.0
+
