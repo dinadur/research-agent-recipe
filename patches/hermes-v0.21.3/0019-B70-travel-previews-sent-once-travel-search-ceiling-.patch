@@ -1,0 +1,151 @@
+From d73362e93ce4860ae7b5c0579c3b2293862bc6b5 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 03:18:08 +0000
+Subject: [PATCH 19/20] B70: travel previews sent once; travel search ceiling
+ 24
+
+- The travel approval delivery path pushed the preview through
+  stream_delta_callback and left _response_was_previewed False, so the
+  gateway also did its normal final send: 6/6 Telegram travel runs on
+  2026-10-08 showed the preview twice ('final-send NOT suppressed ...
+  possible duplicate send'). The preview is now delivered once, by the
+  normal final send.
+- TRAVEL_SEARCH_QUERY_LIMIT 12 -> 24 (and the route note). With one direct
+  official lookup per venue, 12 queries could not reach the route's own
+  16-candidate target: all 6 runs hit the ceiling at 8-15 candidates.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_contract.py       |  6 +++++-
+ agent/research_loop.py           | 10 ++++------
+ agent/travel_route.py            |  4 ++--
+ tests/agent/test_travel_route.py | 16 +++++++++-------
+ 4 files changed, 20 insertions(+), 16 deletions(-)
+
+diff --git a/agent/research_contract.py b/agent/research_contract.py
+index a675199..a89c5b3 100644
+--- a/agent/research_contract.py
++++ b/agent/research_contract.py
+@@ -248,7 +248,11 @@ _TRAVEL_VAULT_MUTATION_RE = re.compile(
+ _TRAVEL_SHELL_CONTROL_RE = re.compile(r"&&|\|\||[;&|<>`]|\r|\n|\$\(")
+ _TRAVEL_READ_ONLY_COMMANDS = frozenset({"ls", "pwd", "sha256sum", "stat"})
+ _TRAVEL_ROUTE_RESERVATION_LOCK = threading.RLock()
+-TRAVEL_SEARCH_QUERY_LIMIT = 12
++# One broad wave (~4 queries) plus one direct-official lookup per venue for the
++# 8-per-category target (16 for attractions and dining) plus a short deficit
++# wave.  At 12 the target was unreachable: 2026-10-08 runs spent 4 broad + 8
++# lookups and stopped at 8-15 candidates against the 16 target.
++TRAVEL_SEARCH_QUERY_LIMIT = 24
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_CALLS = 4
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_SUCCESSES = 3
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_URLS = 8
+diff --git a/agent/research_loop.py b/agent/research_loop.py
+index 79e33b3..7a3c02c 100644
+--- a/agent/research_loop.py
++++ b/agent/research_loop.py
+@@ -464,13 +464,11 @@ def after_research_tools(agent, s):
+         agent._session_messages = s.messages
+         agent._response_was_previewed = False
+         if s.final_response:
++            # Delivered once, by the gateway's normal final send.  Also pushing
++            # it through stream_delta_callback made Telegram show every approval
++            # preview twice (2026-10-08: 6/6 travel runs; the gateway logged
++            # "final-send NOT suppressed ... possible duplicate send").
+             agent._safe_print(f'\n{s.final_response}\n')
+-            if agent.stream_delta_callback:
+-                try:
+-                    agent.stream_delta_callback(s.final_response)
+-                    agent.stream_delta_callback(None)
+-                except Exception:
+-                    pass
+         return 'break'
+     if _verified_delivery is not None:
+         s.final_response, _verified_failed = _verified_delivery
+diff --git a/agent/travel_route.py b/agent/travel_route.py
+index 98119fb..48d376b 100644
+--- a/agent/travel_route.py
++++ b/agent/travel_route.py
+@@ -41,7 +41,7 @@ TRAVEL_PUBLICATION_ROUTE_NOTE = (
+     "eight unique URLs; "
+     "that closes web search for the turn, so use the survivors and do not issue "
+     "a replacement query. Otherwise, do not issue another query wave. Use no "
+-    "more than three parent retrieval waves and 12 individual queries. Start "
++    "more than three parent retrieval waves and 24 individual queries. Start "
+     "with broad multi-candidate category searches, use the second wave only to "
+     "replace directory leads with direct official pages, and reserve the third "
+     "for a category that is still short. Stop as soon as eight direct official "
+@@ -66,7 +66,7 @@ TRAVEL_PUBLICATION_ROUTE_NOTE = (
+     "evidence or draft prose: the controller owns fetch, extraction, quarantine, "
+     "review, rendering, audit, and receipt creation; its terminal tool timeout "
+     "is controller-bound to 900 seconds. The executor closes discovery at "
+-    "12 queries without ending a strong turn: surplus calls are rejected and the "
++    "24 queries without ending a strong turn: surplus calls are rejected and the "
+     "parent must use the successful results already returned. It admits exactly "
+     "one runner/controller call per user turn. The "
+     "controller applies one conservative manifest-shape normalization pass, "
+diff --git a/tests/agent/test_travel_route.py b/tests/agent/test_travel_route.py
+index 0a06c62..b184115 100644
+--- a/tests/agent/test_travel_route.py
++++ b/tests/agent/test_travel_route.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++from agent.research_contract import TRAVEL_SEARCH_QUERY_LIMIT
++
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -160,8 +162,8 @@ def test_route_note_resumes_from_manifest_without_research_or_old_receipt():
+     assert "structured terminal web_search failure" in TRAVEL_PUBLICATION_ROUTE_NOTE
+     assert "do not issue another query wave" in TRAVEL_PUBLICATION_ROUTE_NOTE
+     assert "three parent retrieval waves" in TRAVEL_PUBLICATION_ROUTE_NOTE
+-    assert "12 individual queries" in TRAVEL_PUBLICATION_ROUTE_NOTE
+-    assert "closes discovery at 12 queries" in TRAVEL_PUBLICATION_ROUTE_NOTE
++    assert f"{TRAVEL_SEARCH_QUERY_LIMIT} individual queries" in TRAVEL_PUBLICATION_ROUTE_NOTE
++    assert f"closes discovery at {TRAVEL_SEARCH_QUERY_LIMIT} queries" in TRAVEL_PUBLICATION_ROUTE_NOTE
+     assert "exactly one runner/controller call per user turn" in (
+         TRAVEL_PUBLICATION_ROUTE_NOTE
+     )
+@@ -474,17 +476,17 @@ def test_travel_search_query_budget_is_executor_enforced_and_turn_scoped():
+         _travel_publication_route_turn_id="turn-1",
+         _tool_guardrail_halt_decision=None,
+     )
+-    for index in range(12):
++    for index in range(TRAVEL_SEARCH_QUERY_LIMIT):
+         assert before_agent_tool_call(
+             agent, "web_search", {"query": f"query {index}"}
+         ) is None
+     blocked = before_agent_tool_call(
+-        agent, "web_search", {"query": "query 13"}
++        agent, "web_search", {"query": "query over budget"}
+     )
+     assert blocked is not None
+     assert blocked.code == "travel_search_query_budget_exhausted"
+     assert blocked.terminal_failure is False
+-    assert agent._travel_search_query_count == 12
++    assert agent._travel_search_query_count == TRAVEL_SEARCH_QUERY_LIMIT
+     assert agent._tool_guardrail_halt_decision is None
+     assert agent._travel_search_wave_closed_turn_id == "turn-1"
+     assert agent._travel_search_wave_closed_reason == "query_budget"
+@@ -495,7 +497,7 @@ def test_travel_search_query_budget_is_executor_enforced_and_turn_scoped():
+     assert repeated is not None
+     assert repeated.code == "travel_search_wave_closed_at_query_budget"
+     assert repeated.terminal_failure is False
+-    assert agent._travel_search_query_count == 12
++    assert agent._travel_search_query_count == TRAVEL_SEARCH_QUERY_LIMIT
+     assert agent._tool_guardrail_halt_decision is None
+ 
+     agent._current_turn_id = "turn-2"
+@@ -508,7 +510,7 @@ def test_travel_search_query_budget_is_executor_enforced_and_turn_scoped():
+ 
+ 
+ def test_route_note_closes_search_at_budget_but_continues_to_controller():
+-    assert "closes discovery at 12 queries without ending a strong turn" in (
++    assert f"closes discovery at {TRAVEL_SEARCH_QUERY_LIMIT} queries without ending a strong turn" in (
+         TRAVEL_PUBLICATION_ROUTE_NOTE
+     )
+     assert "use the successful results already returned" in (
+-- 
+2.53.0
+

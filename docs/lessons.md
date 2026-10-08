@@ -132,3 +132,22 @@ through the chat front end, not by unit tests.
     move, so a rollback is two steps: reset the checkout and restore the preflight.
 29. **A canary's per-task timeout does not stop the agent.** Check the gateway's active-agent count before starting
     the next task. Restarting the gateway cancels the in-flight request.
+
+## Travel
+
+30. **Approval previews arrived twice** (0019). The travel route pushed the controller's approval preview through the
+    stream callback and also left it for the gateway's final send, so chat showed it twice (6/6 runs). Fix: deliver it
+    once, through the final send.
+31. **The search ceiling was below the route's own target** (0019). With one direct official lookup per venue, 12
+    searches could not reach 16 candidates; all 6 runs stopped at 8-15. With 24, 3 of 4 runs reached 16.
+32. **The delivery-error message arrived twice** (0020). Same cause as 30, but the second copy carried the failed-turn
+    footer, so it did not look like a duplicate to an exact-match check. Compare messages by prefix when you scan
+    transcripts for duplicates.
+33. **Reruns of a destination reused the old run directory** (0020). The model named the previous attempt's run
+    directory, the request was rejected as "run_dir must be new or empty", and the turn's single controller attempt
+    was spent. Fix: the runner moves the run to a new sibling directory, prints a note before any controller output,
+    and leaves the old directory untouched; the request validation itself stays strict.
+34. **Installing a pinned controller without moving the pin broke every travel request.** The runner refuses a
+    controller whose sha256 does not match its pin. Install the controller and move the pin in one step, keep the old
+    controller beside it, and check `python3 -m agent.research_harness.travel_runner --verify-pin` from every
+    checkout the runner may be started from before sending traffic.

@@ -1,0 +1,236 @@
+From 200a2a2d3f71238f8cb7d5a2f8948236341b7cdc Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:16:19 +0000
+Subject: [PATCH 20/20] B70: travel controller v3 pin; one delivery-error
+ message; fresh run_dir on reruns
+
+- ACCEPTED_TRAVEL_CONTROLLER_SHA256 -> 1cd021b3 (controller v3: a malformed
+  review chunk keeps its valid entries and retries in halves instead of
+  quarantining every venue in it).
+- TRAVEL_RESEARCH_DELIVERY_ERROR is no longer pushed through
+  stream_delta_callback. Telegram showed it twice (the streamed copy, then the
+  final send with the failed-turn footer) on the 2026-10-08 Charleston and
+  Sedona reruns. Same fix as the approval preview in d73362e.
+- The runner moves a reused, non-empty run_dir to a new <name>-rerun-N
+  sibling instead of failing with "run_dir must be new or empty", which spent
+  the turn's single controller attempt on reruns of a destination. The used
+  directory is untouched, the request validation stays strict, and the runner
+  prints a TRAVEL_RESEARCH_RUNNER_NOTE line before any controller output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_harness/travel_runner.py       | 50 +++++++++-
+ agent/research_loop.py                        | 10 +-
+ .../test_research_harness_travel_runner.py    | 95 +++++++++++++++++++
+ 3 files changed, 147 insertions(+), 8 deletions(-)
+
+diff --git a/agent/research_harness/travel_runner.py b/agent/research_harness/travel_runner.py
+index df8288a..aeba8a0 100644
+--- a/agent/research_harness/travel_runner.py
++++ b/agent/research_harness/travel_runner.py
+@@ -28,7 +28,7 @@ from hermes_constants import get_hermes_home
+ 
+ ACCEPTED_TRAVEL_SKILL_VERSION = "2.9.0"
+ ACCEPTED_TRAVEL_CONTROLLER_SHA256 = (
+-    "5e30169a3888529d645adf281d8d40392473f417bdecdc3fc38e1ea63b8b4b58"
++    "1cd021b33a066b277d223ab91f91332130dc1db28da82a2adb3ef25ac0d9c16a"
+ )
+ RUNNER_CONTROLLER_TIMEOUT_SECONDS = 870
+ _VERSION_RE = re.compile(r"^version:\s*([^\s#]+)\s*$", re.MULTILINE)
+@@ -59,6 +59,42 @@ def _artifact_path(run_dir: Path, name: str) -> str | None:
+     return str(path) if path.is_file() else None
+ 
+ 
++def _fresh_sibling_run_dir(run_dir: Path) -> Path:
++    """Return the first unused ``<name>-rerun-N`` sibling of a used run directory."""
++
++    for number in range(2, 100):
++        candidate = run_dir.with_name(f"{run_dir.name}-rerun-{number}")
++        if not candidate.exists():
++            return candidate
++    raise ValueError("run_dir must be new or empty")
++
++
++def load_request_with_fresh_run_dir(
++    path: Path,
++    *,
++    raw_root: Path,
++) -> tuple[TravelRunRequest, Path | None]:
++    """Load a request; a reused, non-empty run_dir moves to a new sibling.
++
++    Re-researching a destination often names the previous attempt's run
++    directory, and the turn's single controller attempt was then spent on
++    "run_dir must be new or empty" (2026-10-08: Sedona and Portland reruns).
++    The used directory is left untouched; the run gets a new, empty sibling
++    and the second value names the directory that was skipped.
++    """
++
++    try:
++        return TravelRunRequest.from_file(path, raw_root=raw_root), None
++    except ValueError as exc:
++        if str(exc) != "run_dir must be new or empty":
++            raise
++    value = dict(load_json_object(path))
++    used = Path(str(value["run_dir"])).expanduser().resolve()
++    value["run_dir"] = str(_fresh_sibling_run_dir(used))
++    request = TravelRunRequest.from_mapping(value, raw_root=raw_root)
++    return request, used
++
++
+ def accepted_controller_status(
+     *,
+     controller: Path | None = None,
+@@ -208,7 +244,16 @@ def main(argv: Sequence[str] | None = None) -> int:
+     if args.request is None:
+         parser.error("request is required unless --verify-pin is used")
+     try:
+-        request = TravelRunRequest.from_file(args.request, raw_root=travel_raw_root())
++        request, used_run_dir = load_request_with_fresh_run_dir(
++            args.request, raw_root=travel_raw_root()
++        )
++        if used_run_dir is not None:
++            # Printed first: the approval block must stay the last output lines.
++            print(
++                f"TRAVEL_RESEARCH_RUNNER_NOTE run_dir {used_run_dir} was not empty; "
++                f"this run uses the new directory {request.run_dir}",
++                flush=True,
++            )
+         result, completed = run_travel_request(request)
+     except ValueError as exc:
+         print(f"TRAVEL_RESEARCH_RUNNER_ERROR {exc}", file=sys.stderr)
+@@ -235,6 +280,7 @@ __all__ = [
+     "RUNNER_CONTROLLER_TIMEOUT_SECONDS",
+     "accepted_controller_status",
+     "build_parser",
++    "load_request_with_fresh_run_dir",
+     "main",
+     "run_travel_request",
+ ]
+diff --git a/agent/research_loop.py b/agent/research_loop.py
+index 7a3c02c..071f665 100644
+--- a/agent/research_loop.py
++++ b/agent/research_loop.py
+@@ -432,13 +432,11 @@ def after_research_tools(agent, s):
+         s.messages.append({'role': 'assistant', 'content': s.final_response})
+         agent._session_messages = s.messages
+         agent._response_was_previewed = False
++        # Delivered once, by the gateway's normal final send (as for the approval
++        # preview below). Streaming it as well sent it twice on Telegram: the
++        # streamed copy, then the final send with the failed-turn footer
++        # (2026-10-08 Charleston and Sedona reruns).
+         agent._safe_print(f'\n{s.final_response}\n')
+-        if agent.stream_delta_callback:
+-            try:
+-                agent.stream_delta_callback(s.final_response)
+-                agent.stream_delta_callback(None)
+-            except Exception:
+-                pass
+         return 'break'
+     if _product_publication_delivery is not None:
+         s.final_response, _publication_failed = _product_publication_delivery
+diff --git a/tests/agent/test_research_harness_travel_runner.py b/tests/agent/test_research_harness_travel_runner.py
+index e65cfb8..d3ab6f5 100644
+--- a/tests/agent/test_research_harness_travel_runner.py
++++ b/tests/agent/test_research_harness_travel_runner.py
+@@ -151,3 +151,98 @@ def test_installed_controller_matches_accepted_pin() -> None:
+     assert status["actual_controller_sha256"] == status[
+         "expected_controller_sha256"
+     ]
++
++
++def _request_file(tmp_path: Path) -> tuple[Path, Path, Path]:
++    raw_root = tmp_path / "vault" / "raw" / "travel"
++    raw_root.mkdir(parents=True)
++    manifest = raw_root / "manifest.json"
++    manifest.write_text(json.dumps({"publication": {"owner": "destination"}}), encoding="utf-8")
++    run_dir = raw_root / "sedona-run"
++    request_path = raw_root / "sedona-request.json"
++    request_path.write_text(
++        json.dumps(
++            {
++                "schema_version": 1,
++                "domain": "travel",
++                "request_id": "runner-rerun",
++                "original_request": "Research a destination.",
++                "manifest_path": str(manifest),
++                "run_dir": str(run_dir),
++            }
++        ),
++        encoding="utf-8",
++    )
++    return raw_root, request_path, run_dir
++
++
++def test_reused_run_dir_moves_to_new_sibling(tmp_path: Path) -> None:
++    from agent.research_harness.travel_runner import load_request_with_fresh_run_dir
++
++    raw_root, request_path, run_dir = _request_file(tmp_path)
++    run_dir.mkdir()
++    (run_dir / "run-state.json").write_text("{}\n", encoding="utf-8")
++
++    request, used = load_request_with_fresh_run_dir(request_path, raw_root=raw_root)
++
++    assert used == run_dir
++    assert request.run_dir == raw_root / "sedona-run-rerun-2"
++    assert not request.run_dir.exists()
++    assert (run_dir / "run-state.json").read_text(encoding="utf-8") == "{}\n"
++
++    request.run_dir.mkdir()
++    (request.run_dir / "run-state.json").write_text("{}\n", encoding="utf-8")
++    again, _ = load_request_with_fresh_run_dir(request_path, raw_root=raw_root)
++    assert again.run_dir == raw_root / "sedona-run-rerun-3"
++
++
++def test_new_run_dir_is_used_as_requested(tmp_path: Path) -> None:
++    from agent.research_harness.travel_runner import load_request_with_fresh_run_dir
++
++    raw_root, request_path, run_dir = _request_file(tmp_path)
++
++    request, used = load_request_with_fresh_run_dir(request_path, raw_root=raw_root)
++
++    assert used is None
++    assert request.run_dir == run_dir
++
++
++def test_other_request_errors_still_fail(tmp_path: Path) -> None:
++    import pytest
++
++    from agent.research_harness.travel_runner import load_request_with_fresh_run_dir
++
++    raw_root, request_path, _ = _request_file(tmp_path)
++    value = json.loads(request_path.read_text(encoding="utf-8"))
++    value["manifest_path"] = str(tmp_path / "outside.json")
++    request_path.write_text(json.dumps(value), encoding="utf-8")
++
++    with pytest.raises(ValueError):
++        load_request_with_fresh_run_dir(request_path, raw_root=raw_root)
++
++
++def test_runner_notice_precedes_controller_output(tmp_path: Path, monkeypatch, capsys) -> None:
++    import subprocess
++
++    from agent.research_harness import travel_runner
++
++    raw_root, request_path, run_dir = _request_file(tmp_path)
++    run_dir.mkdir()
++    (run_dir / "run-state.json").write_text("{}\n", encoding="utf-8")
++    seen = {}
++
++    def fake_run(request):
++        seen["run_dir"] = request.run_dir
++        result = type("R", (), {"status": "ready_for_approval", "error": None})()
++        out = "TRAVEL_RESEARCH_READY x\nBEGIN_TRAVEL_APPROVAL\npreview\nEND_TRAVEL_APPROVAL\n"
++        return result, subprocess.CompletedProcess([], 0, out, "")
++
++    monkeypatch.setattr(travel_runner, "travel_raw_root", lambda: raw_root)
++    monkeypatch.setattr(travel_runner, "run_travel_request", fake_run)
++
++    assert travel_runner.main([str(request_path)]) == 0
++    lines = capsys.readouterr().out.splitlines()
++    assert lines[0].startswith("TRAVEL_RESEARCH_RUNNER_NOTE run_dir ")
++    assert str(raw_root / "sedona-run-rerun-2") in lines[0]
++    assert lines[-1] == "END_TRAVEL_APPROVAL"
++    assert seen["run_dir"] == raw_root / "sedona-run-rerun-2"
+-- 
+2.53.0
+

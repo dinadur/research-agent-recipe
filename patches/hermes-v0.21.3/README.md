@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 18, in order, produced with `git format-patch`.
+- **Patches:** 20, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -30,7 +30,10 @@ Results on the published series:
 
 - that subset: 61 passed;
 - a wider research selection (13 test files, including product route, generic route, research contract, travel route
-  and verified delivery): 511 passed, 2 skipped, 1 failed.
+  and verified delivery): 511 passed, 2 skipped, 1 failed (0001-0018);
+- after 0019-0020, every test file matching product_route, generic_research, research_contract, travel_route,
+  verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files): 483 passed,
+  1 skipped, with a pinned controller copy present.
 
 The one failure, `test_research_harness_travel_runner.py::test_installed_controller_matches_accepted_pin`, needs a
 pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), which is not part of this recipe.
@@ -57,6 +60,8 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0016 | Quality-first drafts keep evidence citations instead of withholding | Outside-evidence links are unlinked and logged instead of withholding; bare evidence URLs count as citations |
 | 0017 | Open-ended product receipts judge every researched candidate | Editorial pages, review publishers and retailers are never official; manufacturer URL naming the model counts as official as a fallback; any fully evidenced searched candidate can carry the receipt |
 | 0018 | Spend an unused repair extraction instead of a premature receipt | In a granted repair round, a receipt call before the granted extraction is rewritten into that extraction |
+| 0019 | Travel previews sent once; travel search ceiling 24 | The approval preview is delivered only by the gateway's final send (it was also streamed, so chat showed it twice); the travel search ceiling rises from 12 to 24 so the route can reach its own 16-candidate target |
+| 0020 | Travel controller pin; one delivery-error message; fresh run directory on reruns | Moves the controller pin to the reference deployment's controller v3 (set it to your own controller's sha256); the delivery-error message is no longer streamed as well; a reused, non-empty run directory moves to a new `<name>-rerun-N` sibling instead of spending the turn's one controller attempt |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 
