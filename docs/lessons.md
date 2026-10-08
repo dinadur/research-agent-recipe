@@ -171,3 +171,13 @@ through the chat front end, not by unit tests.
     changed route. Test your routes with the phrasings people actually use, not just the ones in your suites.
 39. **A canary leaves the chat in its last session.** The canary signs in as the operator's chat account, so the
     operator's next message landed in a travel-locked canary session. End each canary batch with `/new`.
+40. **Most everyday phrasings reached no route** (0025). A sweep of natural phrasings found product 1 of 12, generic 3
+    of 10 and travel 3 of 5 routed. Widening the patterns is easy; the risk is false positives, because a casual
+    question ("a good recipe for banana bread") sent to the product route becomes minutes of shopping research
+    ending in a withheld answer, which is worse than an unrouted reply. So a natural shopping ask also needs a
+    product signal, and every change is checked against a phrasing corpus with chat negatives plus a fresh set of
+    phrasings the patterns were not tuned on (18/18 and 19/20).
+41. **Two copies of one rule drift apart** (0025). The receipt script keeps its own copy of the generic research-intent
+    pattern. After the route was widened, the first live fact-check turns were routed correctly and then rejected
+    by the receipt script ("current turn is not a research request"). Change both in the same deploy, and test that
+    every phrasing the runtime routes is accepted by the script.

@@ -2,7 +2,10 @@
 
 `capture_receipt.py` is the custody step of the research controller (see
 [docs/architecture.md](../../docs/architecture.md#controller-owned-receipts)). This is the version that ran in the
-reference deployment ("v4", sha256 `88e0ade3…`), unchanged.
+reference deployment ("v5", sha256 `c97b81dd…`), unchanged. v5 differs from v4 only in what counts as a research
+request: it mirrors the generic route's intent patterns after patch 0025 ("look into", "find out", "verify",
+"is it true", "check the official docs"). Keep the two in step: a turn the runtime routes to generic research but
+the script does not recognise fails with "current turn is not a research request".
 
 ## Install
 

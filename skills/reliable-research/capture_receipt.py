@@ -100,13 +100,29 @@ NON_PRIMARY_GITHUB_PATH_RE = re.compile(
 # "I'd like to research ..." and "Can you research ..." count as research requests.
 RESEARCH_INTENT_RE = re.compile(
     r"\b(?:research|investigate|look\s+up|find\s+(?:current|recent|official)|"
-    r"current\s+best\s+practices?)\b",
+    r"current\s+best\s+practices?|"
+    r"check\s+(?:the\s+)?(?:official\s+|latest\s+|current\s+)?(?:docs|documentation|sources?|release\s+notes))\b",
+    re.IGNORECASE,
+)
+# Same as the runtime's _EXPLICIT_RESEARCH_ASK_RE (Hermes 48a142f): look-into and
+# fact-check asks are research requests without the word "research".
+EXPLICIT_RESEARCH_ASK_RE = re.compile(
+    r"^\s*(?:(?:hey|hi)\b[\s,!]*)?"
+    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+"
+    r"|i(?:'|\u2019)?d\s+like\s+you\s+to\s+|i\s+would\s+like\s+you\s+to\s+|help\s+me\s+)?"
+    r"(?:look\s+into(?!\s+(?:my|this|that|these|your)\b)|find\s+out|verify|fact[-\s]?check|"
+    r"check\s+(?:what|whether|if|how|when))\b"
+    r"|^\s*is\s+it\s+true\b",
     re.IGNORECASE,
 )
 
 
 def is_research_request(prompt: str) -> bool:
-    return RESEARCH_INTENT_RE.search(prompt or "") is not None
+    prompt = prompt or ""
+    return (
+        RESEARCH_INTENT_RE.search(prompt) is not None
+        or EXPLICIT_RESEARCH_ASK_RE.search(prompt) is not None
+    )
 
 
 class ReceiptError(RuntimeError):

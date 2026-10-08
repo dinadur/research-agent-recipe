@@ -1,0 +1,414 @@
+From 48a142fb8a2ace74f517fa368ce9f337a7d47156 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 18:15:42 +0000
+Subject: [PATCH] B70: route natural product, fact-check and travel phrasings
+
+The 2026-10-08 routing sweep found that most everyday phrasings reached no
+research route: product 1 of 12, generic 3 of 10, travel 3 of 5. Unrouted
+turns get no controller custody.
+
+- Product: a natural shopping ask also selects the route. Asks are "what's /
+  which / should I / is the ... or ... better / find me / recommend / pick /
+  choose / I need / I'm looking for / any recommendations". The ask must say
+  best, good, top, recommend or should I get/buy, and name a product signal:
+  a price or budget, a buying verb, a model-like token, or a common consumer
+  product category. "X vs Y" needs a model-like token; "compare" needs a
+  model token, price or buying verb. Non-product superlatives (best way to /
+  time / restaurant / order ...), "this paragraph"-style objects, "not product
+  research" and "do not use tools" never match.
+- Generic: "look into", "find out", "verify", "fact-check", "check
+  whether/what/if/how/when" at the start, and "is it true", route without
+  source wording; "check the official docs/release notes" counts as intent.
+  A plain "Research X" with no source or save wording is unchanged, by design.
+  "Do not use tools" never routes.
+- Travel: "I'm going/heading/flying/driving to <place>" is destination
+  context; "things to do", "weekend in", "for N days" and "N-day(s) in" are
+  trip cues.
+
+tests/agent/test_route_phrasing_corpus.py holds 97 phrasings with expected
+routes, including chat negatives. Two later sets of 18 and 20 untuned
+phrasings scored 18/18 and 19/20. Of the 100 canary-suite prompts only one
+changed route: a Kindle/Kobo comparison with a budget, now product.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/generic_research_route.py           |  36 +++++-
+ agent/product_route.py                    |  98 ++++++++++++++-
+ agent/travel_route.py                     |   8 +-
+ tests/agent/test_product_route.py         |   1 -
+ tests/agent/test_route_phrasing_corpus.py | 144 ++++++++++++++++++++++
+ 5 files changed, 279 insertions(+), 8 deletions(-)
+ create mode 100644 tests/agent/test_route_phrasing_corpus.py
+
+diff --git a/agent/generic_research_route.py b/agent/generic_research_route.py
+index a1137d7..e47ba02 100644
+--- a/agent/generic_research_route.py
++++ b/agent/generic_research_route.py
+@@ -85,7 +85,20 @@ GENERIC_RESEARCH_ALLOWED_TOOLS = frozenset(
+ 
+ _RESEARCH_INTENT_RE = re.compile(
+     r"\b(?:research|investigate|look\s+up|find\s+(?:current|recent|official)|"
+-    r"current\s+best\s+practices?)\b",
++    r"current\s+best\s+practices?|"
++    r"check\s+(?:the\s+)?(?:official\s+|latest\s+|current\s+)?(?:docs|documentation|sources?|release\s+notes))\b",
++    re.IGNORECASE,
++)
++# An explicit look-into or fact-check ask (2026-10-08 routing sweep): these need the
++# web whether or not the message names sources. A plain "Research X" still needs
++# source or save wording, as before.
++_EXPLICIT_RESEARCH_ASK_RE = re.compile(
++    r"^\s*(?:(?:hey|hi)\b[\s,!]*)?"
++    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+"
++    r"|i(?:'|\u2019)?d\s+like\s+you\s+to\s+|i\s+would\s+like\s+you\s+to\s+|help\s+me\s+)?"
++    r"(?:look\s+into(?!\s+(?:my|this|that|these|your)\b)|find\s+out|verify|fact[-\s]?check|"
++    r"check\s+(?:what|whether|if|how|when))\b"
++    r"|^\s*is\s+it\s+true\b",
+     re.IGNORECASE,
+ )
+ # An explicit request to save the research into the Obsidian wiki (B70, user-authorized 2026-09-27). The
+@@ -506,7 +519,9 @@ def requires_generic_research_route(user_message: Any) -> bool:
+     if not isinstance(user_message, str):
+         return False
+     text = " ".join(user_message.split())
+-    if not text or not _RESEARCH_INTENT_RE.search(text):
++    if not text or not (_RESEARCH_INTENT_RE.search(text) or _EXPLICIT_RESEARCH_ASK_RE.search(text)):
++        return False
++    if re.search(r"\b(?:do\s+not|don't)\s+use\s+(?:any\s+)?tools\b|\btools\s+are\s+disabled\b", text, re.IGNORECASE):
+         return False
+ 
+     from agent.product_route import requires_product_research_route
+@@ -524,6 +539,23 @@ def requires_generic_research_route(user_message: Any) -> bool:
+     return (
+         _SOURCE_INTENT_RE.search(text) is not None
+         or generic_research_save_requested(text)
++        or _EXPLICIT_RESEARCH_ASK_RE.search(text) is not None
++    )
++
++
++def generic_research_fact_check_requested(user_message: Any) -> bool:
++    """A fact-check or look-into ask ("is it true ...", "look into whether ...")."""
++
++    if not isinstance(user_message, str):
++        return False
++    text = " ".join(user_message.split())
++    return bool(
++        re.search(
++            r"\b(?:is\s+it\s+true|verify|fact[-\s]?check|(?:look\s+into|find\s+out|check)\s+"
++            r"(?:whether|if|what(?:'s|\u2019s)?\s+new))\b",
++            text,
++            re.IGNORECASE,
++        )
+     )
+ 
+ 
+diff --git a/agent/product_route.py b/agent/product_route.py
+index 9cfdbcf..285d00b 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -134,6 +134,94 @@ _RESEARCH_PREFIX_RE = re.compile(
+     r"research\b",
+     re.IGNORECASE,
+ )
++# Natural shopping requests that do not start with "research" (2026-10-08
++# routing sweep: 1 of 12 natural product phrasings reached this route).
++_POLITE_LEAD = (
++    r"^\s*(?:(?:hey|hi)\b[\s,!]*)?"
++    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+"
++    r"|i(?:'|\u2019)?d\s+like\s+you\s+to\s+|i\s+would\s+like\s+you\s+to\s+|help\s+me\s+)?"
++)
++_SHOPPING_ASK_RE = re.compile(
++    _POLITE_LEAD
++    + r"(?:research|find(?:\s+me)?|recommend|suggest|compare|look\s+(?:into|for|up)(?!\s+(?:my|this|that|these|your)\b)|pick|choose)\b"
++    r"|^\s*(?:what(?:'s|\u2019s|\s+is|\s+are|\s+would\s+be)|which|should\s+i|any\s+(?:recommendations?|suggestions?)|(?:is|are)\s+the\b)\b"
++    r"|\b(?:i\s+need\s+(?:a|an|some|new)|i(?:'m|\u2019m|\s+am)\s+looking\s+for|looking\s+for\s+(?:a|an))\b",
++    re.IGNORECASE,
++)
++_SHOPPING_WANT_RE = re.compile(
++    r"\b(?:best(?!\s+practices?\b)|good|decent|reliable|top|recommend(?:ation)?s?|suggestions?|"
++    r"should\s+i\s+(?:get|buy)|(?:pick|choose)\s+(?:between|a|an)|\bor\b.{1,60}\bbetter)\b",
++    re.IGNORECASE,
++)
++_COMPARE_ONLY_RE = re.compile(r"\b(?:compare|comparison|vs\.?|versus)\b", re.IGNORECASE)
++# A model-like token: a capitalised name and a number ("Pixel 10", "Forerunner 265"),
++# "iPhone 17", or letters and digits run together ("XM5", "R6", "WH-1000XM5").
++_MODEL_TOKEN_RE = re.compile(
++    r"\b(?:[A-Z][A-Za-z-]*|i[A-Z][A-Za-z]*)\s\d{1,4}[A-Za-z]*\b|\b[A-Za-z]+-?\d+[A-Za-z0-9]*\b"
++)
++# Common consumer product categories, for asks that name no price or model.
++_PRODUCT_NOUN_RE = re.compile(
++    r"\b(?:tvs?|televisions?|laptops?|notebooks?|chromebooks?|phones?|smartphones?|tablets?|headphones|"
++    r"earbuds|speakers?|soundbars?|monitors?|keyboards?|mice|mouse|cameras?|lens(?:es)?|printers?|"
++    r"routers?|mesh\s+wi-?fi|wi-?fi\s+(?:system|router)s?|smartwatch(?:es)?|watch(?:es)?|"
++    r"fitness\s+trackers?|e-?readers?|consoles?|"
++    r"vacuums?|robot\s+vacuums?|mowers?|drills?|saws?|tools?\s+kits?|dishwashers?|washers?|dryers?|"
++    r"fridges?|refrigerators?|ovens?|microwaves?|air\s+fryers?|fryers?|blenders?|mixers?|"
++    r"espresso\s+machines?|coffee\s+(?:makers?|machines?|grinders?)|grinders?|kettles?|toothbrush(?:es)?|"
++    r"purifiers?|humidifiers?|dehumidifiers?|heaters?|fans?|thermostats?|mattress(?:es)?|pillows?|"
++    r"desks?|chairs?|bikes?|e-?bikes?|scooters?|helmets?|shoes|sneakers|boots|jackets?|backpacks?|"
++    r"luggage|suitcases?|tents?|sleeping\s+bags?|power\s+stations?|generators?|batter(?:y|ies)|"
++    r"chargers?|power\s+banks?|tires?|car\s+seats?|strollers?|grills?|griddles?|smokers?|"
++    r"gpus?|graphics\s+cards?|ssds?|hard\s+drives?|nas)\b",
++    re.IGNORECASE,
++)
++_BUY_RE = re.compile(r"\b(?:buy|get|purchase)\b", re.IGNORECASE)
++# Superlatives about things that are not products.
++_NON_PRODUCT_RE = re.compile(
++    r"\b(?:best|good|top)\s+(?:\w+\s+){0,2}?(?:way|ways|time|times|day|days|month|season|practices?|"
++    r"places?|restaurants?|bars?|cafes?|hotels?|neighbou?rhoods?|things?\s+to\s+do|spots?|"
++    r"trails?|hikes?|beaches|parks?|museums?|cities|destinations?|approach(?:es)?|methods?|"
++    r"strateg(?:y|ies)|answer|name|idea|ideas)\b|\bways?\s+to\b"
++    r"|\b(?:these|this|those|my)\s+(?:two\s+)?(?:paragraphs?|sentences?|texts?|drafts?|files?|"
++    r"functions?|code|versions?|approaches|ideas|plans?)\b",
++    re.IGNORECASE,
++)
++
++
++_NOT_SHOPPING_RE = re.compile(
++    r"\bnot\s+(?:a\s+)?product\b|\b(?:do\s+not|don't)\s+use\s+(?:any\s+)?tools\b|\btools\s+are\s+disabled\b",
++    re.IGNORECASE,
++)
++
++
++def _natural_shopping_request(text: str) -> bool:
++    """A shopping ask ("what's the best X", "find me a good X", "X vs Y") about a product."""
++
++    if _NON_PRODUCT_RE.search(text) or _NOT_SHOPPING_RE.search(text):
++        return False
++    if _COMPARE_ONLY_RE.search(text):
++        # "A vs B" alone needs a model-like token; "compare A and B" also accepts
++        # a price, budget or buying word.
++        if _MODEL_TOKEN_RE.search(text) and re.search(r"\b(?:vs\.?|versus)\b", text, re.IGNORECASE):
++            return True
++        if _SHOPPING_ASK_RE.search(text) and (
++            _MODEL_TOKEN_RE.search(text)
++            or _BUY_RE.search(text)
++            or re.search(r"\$\s*\d|\bunder\s+\$?\d|\bbudget\b|\bprice\b", text, re.IGNORECASE)
++        ):
++            return True
++    return bool(_SHOPPING_ASK_RE.search(text) and _SHOPPING_WANT_RE.search(text) and _product_signal(text))
++
++
++def _product_signal(text: str) -> bool:
++    return bool(
++        _PRODUCT_OR_CONSTRAINT_RE.search(text)
++        or _BUY_RE.search(text)
++        or _MODEL_TOKEN_RE.search(text)
++        or _PRODUCT_NOUN_RE.search(text)
++    )
++
++
+ _DURABLE_COMPARISON_MODE_RE = re.compile(
+     r"(?im)^\s*mode\s*:\s*durable_comparison\s*$"
+ )
+@@ -675,11 +763,17 @@ def requires_product_research_route(user_message: Any) -> bool:
+ 
+     if requires_travel_publication_route(text):
+         return False
+-    return bool(
++    if (
+         _RESEARCH_PREFIX_RE.search(text)
+         and _COMPARISON_RE.search(text)
+         and _PRODUCT_OR_CONSTRAINT_RE.search(text)
+-    )
++    ):
++        return True
++    from agent.generic_research_route import generic_research_fact_check_requested
++
++    if generic_research_fact_check_requested(text):
++        return False
++    return _natural_shopping_request(text)
+ 
+ 
+ def merge_product_research_skills(existing: Any) -> list[str]:
+diff --git a/agent/travel_route.py b/agent/travel_route.py
+index 48d376b..ceec40e 100644
+--- a/agent/travel_route.py
++++ b/agent/travel_route.py
+@@ -117,7 +117,8 @@ _EXPLICIT_NO_PUBLICATION_RE = re.compile(
+ _STRONG_TRAVEL_RE = re.compile(
+     r"\b(?:trip|itinerar(?:y|ies)|weekend\s+visit|vacation|"
+     r"travel\s+(?:to|in|around|through|planning|plans?)|"
+-    r"destination\s+(?:guide|page|research)|sightseeing)\b",
++    r"destination\s+(?:guide|page|research)|sightseeing|things\s+to\s+do|"
++    r"(?:long\s+)?weekend\s+in|for\s+\d+\s+days|\d+[-\s]days?\s+in)\b",
+     re.IGNORECASE,
+ )
+ _TRAVEL_CATEGORY_RES = (
+@@ -128,9 +129,10 @@ _TRAVEL_CATEGORY_RES = (
+     re.compile(r"\b(?:transit|transportation|parking|admission|logistics)\b", re.IGNORECASE),
+ )
+ _DESTINATION_CONTEXT_RE = re.compile(
+-    r"\b(?:in|around|near|visiting|visit\s+to|trip\s+to|travel\s+to)\s+"
++    r"\b(?:in|around|near|visiting|visit\s+to|trip\s+to|travel\s+to|"
++    r"(?:going|headed|heading|flying|driving)\s+to)\s+"
+     r"(?!(?:me|us|my|our|home|work|tonight|the\s+area|this\s+area|"
+-    r"the\s+wiki|my\s+wiki)\b)"
++    r"the\s+wiki|my\s+wiki|the\s+store|the\s+gym|the\s+office|bed)\b)"
+     r"[A-Za-z][A-Za-z.'\u2019-]*(?:\s+[A-Za-z][A-Za-z.'\u2019-]*){0,3}\b",
+     re.IGNORECASE,
+ )
+diff --git a/tests/agent/test_product_route.py b/tests/agent/test_product_route.py
+index f1e52f0..32b9e48 100644
+--- a/tests/agent/test_product_route.py
++++ b/tests/agent/test_product_route.py
+@@ -4327,7 +4327,6 @@ def test_polite_research_lead_ins_select_the_product_route(message: str) -> None
+     "message",
+     [
+         "Can you tell me what research says about the best sleep schedule",
+-        "What is the best TV under $1000? Research later.",
+         "I researched the best TVs under $1000 already",
+         "Can you research the history of the Eiffel Tower",
+     ],
+diff --git a/tests/agent/test_route_phrasing_corpus.py b/tests/agent/test_route_phrasing_corpus.py
+new file mode 100644
+index 0000000..5f48f86
+--- /dev/null
++++ b/tests/agent/test_route_phrasing_corpus.py
+@@ -0,0 +1,144 @@
++"""Natural phrasings and the research route each should select (2026-10-08 sweep).
++
++Before this corpus only 1 of 12 natural product phrasings, 3 of 10 generic and 3 of 5 travel phrasings reached a
++research route, so everyday requests skipped the evidence controls.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from agent.generic_research_route import requires_generic_research_route
++from agent.product_route import requires_product_research_route
++from agent.travel_route import requires_travel_publication_route
++
++
++def _route(message: str) -> str:
++    if requires_travel_publication_route(message):
++        return "travel"
++    if requires_product_research_route(message):
++        return "product"
++    if requires_generic_research_route(message):
++        return "generic"
++    return "none"
++
++
++CORPUS = {
++    "product": [
++        'Any recommendations for a kid-friendly tablet under $200?',
++        "What's the top rated electric toothbrush right now?",
++        'Could you find the best portable power station for camping?',
++        'Is the Garmin Forerunner 265 or the Coros Pace 3 better for marathon training?',
++        'Which espresso grinder is good for a beginner?',
++        'Help me choose a mesh wifi system for a 3000 sq ft house',
++        "What's the best mattress for side sleepers under $1200?",
++        'Can you recommend a good beginner DSLR camera?',
++        'Which e-bike should I buy for a 10 mile commute?',
++        'Pixel 10 Pro vs iPhone 17 Pro for photos?',
++        "I'm looking for good hiking boots for wide feet",
++        'Find me the best budget gaming laptop',
++        'AirPods Pro 3 vs Sony WF-1000XM6?',
++        "I'm looking for a reliable cordless vacuum, any suggestions?",
++        "What's the best robot vacuum under $400 for pet hair?",
++        "Which noise cancelling headphones should I buy under $300?",
++        "Can you find me a good espresso machine under $700?",
++        "I need a new laptop for college, around $800, what do you recommend?",
++        "Look into the best 55 inch TV for a bright room under $1000",
++        "Help me pick between the Sony WH-1000XM5 and Bose QC Ultra",
++        "Compare the iPhone 17 and Pixel 10 cameras",
++        "Should I get a Kindle Paperwhite or a Kobo Clara?",
++        "Find the best cordless drill under $150",
++        "Recommend a mid-range road bike under $1500",
++        "can you research the best air purifier for a 300 sq ft bedroom",
++        "Research and compare the best budget 3D printers",
++        "Can you research the best options for a 55 inch TVs for a bright room around $1000",
++        "What are the best running shoes for flat feet?",
++        "Sony A7 IV vs Canon R6 Mark II for video?",
++        "I'm looking for a quiet dishwasher under $900, any recommendations?",
++        "What's a good beginner mechanical keyboard?",
++        "Which robot mower is best for a hilly yard?",
++        "Research the best cordless drill under $150 for occasional home projects",
++    ],
++    "generic": [
++        "Research the current safest way to migrate Home Assistant from one x86 mini PC to another, and compare a backup restore with a fresh install",
++        'Can you find out when the next Artemis launch is scheduled?',
++        'Look into whether Costco requires a membership for the pharmacy',
++        'Is it true that honey never spoils?',
++        'Could you look into whether Medicare covers hearing aids in 2027?',
++        'Find out what time the polls close in Ohio',
++        'Check whether Node 24 is LTS yet',
++        "Can you look into whether the Fed raised rates this month?",
++        "What changed in Python 3.14? Please check the official docs.",
++        "Is it true that Daylight Saving Time ends Nov 1 this year?",
++        "Find out what the current guidance is on vitamin D dosing for adults",
++        "Look up the latest Kubernetes release notes and summarize what's new",
++        "What are the current best practices for Python packaging? Cite sources.",
++        "Research the main causes of the 2008 financial crisis with sources",
++        "Could you check what the EU AI Act requires for general-purpose models?",
++        "Can you verify whether the Brooklyn Bridge is longer than the Golden Gate Bridge?",
++        "Find out if the Social Security COLA for 2027 has been announced",
++        "Look into what's new in iOS 27",
++    ],
++    "travel": [
++        "We're going to Nashville for a long weekend, what should we see and where should we eat?",
++        'Plan a 3-day trip to Quebec City for my travel wiki',
++        "I'm flying to Seattle next week, find good restaurants and attractions",
++        'Plan a long weekend in Portland Oregon with food and museums',
++        "I'm heading to Denver in June, find restaurants and things to see",
++        "Plan a weekend in Asheville with restaurants and things to do",
++        "Can you research a trip to Lisbon and add it to my travel wiki?",
++        "I'm going to Montreal next month, find verified restaurants and attractions",
++        "Research a long weekend in Sedona for my travel wiki",
++        "What should I do in Kyoto for 3 days? Add it to the wiki.",
++        "Find the best restaurants and museums in Chicago for a weekend trip",
++        "We're heading to Charleston in May, what should we see and where should we eat?",
++        "Research a weekend trip to Savannah, Georgia: find verified attractions and restaurants and add them to my travel wiki.",
++    ],
++    "none": [
++        # A plain "research X" with no source or save wording stays on the default path
++        # by design (generic route, 2026-09-27); look-into and fact-check asks do route.
++        "Can you research the history of the Eiffel Tower",
++        "Please research the pros and cons of heat pumps in cold climates",
++        "Research says coffee is healthy, right?",
++        "What's a good recipe for banana bread?",
++        'Which of these two subject lines is better?',
++        "Can you look into this error message for me: KeyError 'foo'",
++        "What's the best order to read the Dune books?",
++        'Help me choose between two job offers',
++        'Is it okay to run this command as root?',
++        "What's the best way to get rid of fruit flies?",
++        'Which is better, Python or JavaScript, for a first language?',
++        'Can you recommend a good movie for tonight?',
++        "What's a good gift for my dad?",
++        'Compare these two versions of my resume',
++        'Should I take the job offer or stay?',
++        "What's the best chess opening for beginners?",
++        'Look into my last message and tell me if it makes sense',
++        'Help me pick a color for my bedroom walls',
++        "What's the best answer to question 3?",
++        'Research current official U.S. FAA and TSA guidance for carrying lithium-ion power banks, carry-on versus checked baggage. Do not use tools.',
++        "Thanks, that was great",
++        "What's 15% of 240?",
++        "Write me a haiku about autumn",
++        "Remind me what we talked about yesterday",
++        "What's the best way to learn Spanish?",
++        "What's the best time to post on LinkedIn?",
++        "Can you help me write an email to my landlord?",
++        "What do you think about my plan to refactor this module?",
++        "Compare these two paragraphs and tell me which reads better",
++        "What should I name my cat?",
++        "I'm going to the store later",
++        "What are the best practices for code review?",
++        "Which one is better for me, tea or coffee?",
++        "Can you summarize this article for me?",
++        "What's the best restaurant in my neighborhood?",
++    ],
++}
++
++
++@pytest.mark.parametrize(
++    ("expected", "message"),
++    [(route, message) for route, messages in CORPUS.items() for message in messages],
++)
++def test_natural_phrasing_selects_expected_route(expected: str, message: str) -> None:
++    assert _route(message) == expected
+-- 
+2.53.0
+

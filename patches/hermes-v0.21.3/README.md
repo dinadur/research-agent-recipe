@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 24, in order, produced with `git format-patch`.
+- **Patches:** 25, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -31,8 +31,8 @@ Results on the published series:
 - that subset: 61 passed;
 - a wider research selection (13 test files, including product route, generic route, research contract, travel route
   and verified delivery): 511 passed, 2 skipped, 1 failed (0001-0018);
-- after 0019-0024, every test file matching product_route, generic_research, research_contract, travel_route,
-  verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files): 500 passed,
+- after 0019-0025, every test file matching product_route, generic_research, research_contract, travel_route,
+  verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files) plus the routing corpus: 598 passed,
   1 skipped, with a pinned controller copy present.
 
 The one failure, `test_research_harness_travel_runner.py::test_installed_controller_matches_accepted_pin`, needs a
@@ -66,6 +66,7 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0022 | Travel controller v4 pin (schema-enforced review chunks) | Moves the pin to the reference controller v4, which sends review chunks with a strict `json_schema` response format (set it to your own controller's sha256) |
 | 0023 | Send a thin travel manifest back to discovery once | Before the turn's single controller attempt, a manifest below 8 candidates per category (16 total) is returned once while at least 4 searches remain; not a failure and not the controller boundary |
 | 0024 | Product route accepts polite lead-ins before "research" | "Can/could/would you (please)", "please", "I'd like you to", "help me" (and a leading hey/hi) before "research" select the product route |
+| 0025 | Route natural product, fact-check and travel phrasings | Natural shopping asks with a product signal (price, buying verb, model token or common product category) select the product route; look-into / find-out / verify / "is it true" asks select generic research; "heading to <place>" and "N days in" count as travel. `tests/agent/test_route_phrasing_corpus.py` holds 97 phrasings with expected routes. Needs receipt script v5 |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 
