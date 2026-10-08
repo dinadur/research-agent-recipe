@@ -1,0 +1,287 @@
+From 12aed0d3f15b48d6230f426cc192d3789540e540 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 13:31:03 +0000
+Subject: [PATCH 23/24] B70: send a thin travel manifest back to discovery once
+
+Discovery often stopped with half the search budget unused. On 2026-10-08
+the Savannah turn used 12 of 24 searches, wrote a 7-candidate manifest
+(attraction 5, restaurant 2) and published 6. The controller only warned
+about breadth after the run. Runs that used most of the budget reached 13-17.
+
+Before the turn's single controller attempt is reserved, the first
+controller call of a turn now reads the source manifest. If a category has
+fewer than 8 candidates (or a multi-category manifest has fewer than 16),
+web search is still open and at least 4 searches remain, the call is
+rejected without executing. The model is told the counts and the remaining
+searches, and asked to add venues in the short categories. The check runs
+once per turn; the next controller call is admitted as before. The targets
+mirror the controller's breadth report.
+
+The rejection is not a controller failure (no halt latch) and not a
+controller boundary (no TRAVEL_RESEARCH_DELIVERY_ERROR).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_contract.py       | 96 ++++++++++++++++++++++++++++++++
+ agent/verified_tool_delivery.py  | 13 +++++
+ tests/agent/test_travel_route.py | 95 +++++++++++++++++++++++++++++++
+ 3 files changed, 204 insertions(+)
+
+diff --git a/agent/research_contract.py b/agent/research_contract.py
+index 21d0cee..860481e 100644
+--- a/agent/research_contract.py
++++ b/agent/research_contract.py
+@@ -253,6 +253,14 @@ _TRAVEL_ROUTE_RESERVATION_LOCK = threading.RLock()
+ # wave.  At 12 the target was unreachable: 2026-10-08 runs spent 4 broad + 8
+ # lookups and stopped at 8-15 candidates against the 16 target.
+ TRAVEL_SEARCH_QUERY_LIMIT = 24
++# Discovery breadth targets, mirroring the controller's breadth report
++# (publication_receipt.MIN_CANDIDATES_PER_CATEGORY / MIN_TOTAL_MULTI_CATEGORY).
++TRAVEL_MIN_CANDIDATES_PER_CATEGORY = 8
++TRAVEL_MIN_TOTAL_MULTI_CATEGORY = 16
++# A short manifest is sent back for more discovery only while this many
++# searches remain; with fewer, the controller runs on what was found.
++TRAVEL_BREADTH_MIN_REMAINING_SEARCHES = 4
++TRAVEL_DISCOVERY_BREADTH_CODE = "travel_discovery_breadth_short"
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_CALLS = 4
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_SUCCESSES = 3
+ TRAVEL_PARTIAL_SEARCH_TURN_MIN_URLS = 8
+@@ -285,6 +293,56 @@ def _absolute_path_under_travel_raw(value: Any) -> bool:
+     return True
+ 
+ 
++def _travel_manifest_records(args: Mapping[str, Any] | None) -> list[Any] | None:
++    """Return the source manifest's records for an exact controller call, or None."""
++
++    try:
++        tokens = shlex.split(str((args or {}).get("command") or ""), posix=True)
++    except ValueError:
++        return None
++    manifest_path: Any = None
++    try:
++        if len(tokens) == 4 and tokens[1:3] == ["-m", TRAVEL_RUNNER_MODULE]:
++            request = json.loads(Path(tokens[3]).read_text(encoding="utf-8"))
++            manifest_path = request.get("manifest_path") if isinstance(request, dict) else None
++        elif len(tokens) >= 3:
++            manifest_path = tokens[2]
++        if not _absolute_path_under_travel_raw(manifest_path):
++            return None
++        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
++    except (OSError, ValueError, TypeError):
++        return None
++    if not isinstance(manifest, dict):
++        return None
++    records = manifest.get("records")
++    if not isinstance(records, list):
++        records = manifest.get("candidates")
++    return records if isinstance(records, list) else None
++
++
++def travel_discovery_breadth_shortfall(records: list[Any]) -> str | None:
++    """Describe how a manifest falls short of the breadth targets, or None."""
++
++    counts: dict[str, int] = {}
++    for record in records:
++        category = str((record.get("category") if isinstance(record, dict) else None) or "uncategorized")
++        counts[category] = counts.get(category, 0) + 1
++    short = [
++        f"{category} {count}"
++        for category, count in sorted(counts.items())
++        if count < TRAVEL_MIN_CANDIDATES_PER_CATEGORY
++    ]
++    total_short = len(counts) > 1 and len(records) < TRAVEL_MIN_TOTAL_MULTI_CATEGORY
++    if not short and not total_short:
++        return None
++    per_category = ", ".join(f"{c} {n}" for c, n in sorted(counts.items()))
++    return (
++        f"the manifest has {len(records)} candidate(s) ({per_category}); the target is "
++        f"at least {TRAVEL_MIN_CANDIDATES_PER_CATEGORY} per category"
++        + (f" and {TRAVEL_MIN_TOTAL_MULTI_CATEGORY} in total" if len(counts) > 1 else "")
++    )
++
++
+ def _travel_script_allowlist() -> dict[str, Path]:
+     from hermes_constants import get_hermes_home
+ 
+@@ -397,6 +455,8 @@ def _travel_controller_result_failed(result: Any, failed: bool) -> bool:
+             return False
+     if not isinstance(value, dict):
+         return False
++    if value.get("code") == TRAVEL_DISCOVERY_BREADTH_CODE and value.get("executed") is False:
++        return False  # sent back to discovery before the controller ran
+     status = str(value.get("status") or "").strip().casefold()
+     return bool(
+         value.get("success") is False
+@@ -5173,6 +5233,42 @@ def before_agent_tool_call(
+                     executed=False,
+                 )
+             if _travel_route_is_controller_call(args):
++                # Discovery often stopped with half the search budget unused and
++                # a thin manifest (2026-10-08 Savannah: 12 of 24 searches, 7
++                # candidates, 6 published). Send a short manifest back once,
++                # before the turn's single controller attempt is spent.
++                if getattr(agent, "_travel_breadth_check_turn_id", None) != current_turn_id:
++                    agent._travel_breadth_check_turn_id = current_turn_id
++                    used = (
++                        getattr(agent, "_travel_search_query_count", 0)
++                        if getattr(agent, "_travel_search_budget_turn_id", None) == current_turn_id
++                        else 0
++                    )
++                    remaining = TRAVEL_SEARCH_QUERY_LIMIT - (used if isinstance(used, int) else 0)
++                    search_open = getattr(agent, "_travel_search_wave_closed_turn_id", None) != current_turn_id
++                    records = _travel_manifest_records(args)
++                    shortfall = travel_discovery_breadth_shortfall(records) if records is not None else None
++                    if shortfall and search_open and remaining >= TRAVEL_BREADTH_MIN_REMAINING_SEARCHES:
++                        logging.info(
++                            "Travel discovery breadth short before the controller (%s; %d searches left); "
++                            "returned to discovery once",
++                            shortfall,
++                            remaining,
++                        )
++                        return ResearchContractDecision(
++                            TRAVEL_DISCOVERY_BREADTH_CODE,
++                            f"Not run yet: {shortfall}, and {remaining} of "
++                            f"{TRAVEL_SEARCH_QUERY_LIMIT} searches remain this turn. Search for "
++                            "more venues in the short categories (batch the searches; one direct "
++                            "official URL per venue, no directories or listicles as sources), add "
++                            "them to the manifest, then run the same controller command again. "
++                            "This check runs once per turn: the next controller call is admitted "
++                            "even if coverage is still short. Do not invent venues.",
++                            terminal_failure=False,
++                            status="rejected",
++                            retryable=True,
++                            executed=False,
++                        )
+                 admitted, count = _reserve_travel_turn_action(
+                     agent,
+                     turn_attribute="_travel_controller_attempt_turn_id",
+diff --git a/agent/verified_tool_delivery.py b/agent/verified_tool_delivery.py
+index 681894b..64cd6fd 100644
+--- a/agent/verified_tool_delivery.py
++++ b/agent/verified_tool_delivery.py
+@@ -240,6 +240,19 @@ def travel_research_controller_boundary(
+     tool_call, _arguments, _tokens = invocation
+     message = tool_result_messages[0]
+     call_id = _tool_call_id(tool_call)
++    if isinstance(message, Mapping):
++        try:
++            payload = json.loads(str(message.get("content") or ""))
++        except (TypeError, ValueError, json.JSONDecodeError):
++            payload = None
++        if (
++            isinstance(payload, dict)
++            and payload.get("code") == "travel_discovery_breadth_short"
++            and payload.get("executed") is False
++        ):
++            # The one-time breadth check sent the call back to discovery
++            # before the controller ran; the turn continues.
++            return False
+     return bool(
+         isinstance(message, Mapping)
+         and message.get("role") == "tool"
+diff --git a/tests/agent/test_travel_route.py b/tests/agent/test_travel_route.py
+index e967306..a45bf38 100644
+--- a/tests/agent/test_travel_route.py
++++ b/tests/agent/test_travel_route.py
+@@ -804,3 +804,98 @@ def test_terminal_quarantine_latch_removes_delegate_on_later_turns():
+     tools = [_schema("delegate_task"), _schema("web_search")]
+     filtered = filter_parallel_research_api_tools(agent, tools)
+     assert [item["function"]["name"] for item in filtered] == ["web_search"]
++
++
++def _breadth_turn(monkeypatch, tmp_path: Path, per_category: dict[str, int]):
++    import json as _json
++
++    vault = tmp_path / "vault"
++    raw = vault / "raw/travel"
++    raw.mkdir(parents=True)
++    records = [
++        {"id": f"{category}-{index}", "category": category}
++        for category, count in per_category.items()
++        for index in range(count)
++    ]
++    manifest = raw / "topic-manifest.json"
++    manifest.write_text(_json.dumps({"publication": {"owner": "destination"}, "records": records}), encoding="utf-8")
++    request = raw / "topic-request.json"
++    request.write_text(
++        _json.dumps({"manifest_path": str(manifest), "run_dir": str(raw / "topic-run")}),
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
++    agent = SimpleNamespace(
++        _current_turn_id="turn-1",
++        _travel_publication_route_turn_id="turn-1",
++        _tool_guardrail_halt_decision=None,
++    )
++    command = f"python3 -m agent.research_harness.travel_runner {request}"
++    return agent, command
++
++
++def test_thin_manifest_returns_to_discovery_once(monkeypatch, tmp_path: Path):
++    agent, command = _breadth_turn(monkeypatch, tmp_path, {"attraction": 5, "restaurant": 2})
++    agent._travel_search_budget_turn_id = "turn-1"
++    agent._travel_search_query_count = 12
++
++    first = before_agent_tool_call(agent, "terminal", {"command": command})
++    assert first is not None
++    assert first.code == "travel_discovery_breadth_short"
++    assert first.executed is False and first.terminal_failure is False
++    assert "7 candidate(s) (attraction 5, restaurant 2)" in first.message
++    assert "12 of 24 searches remain" in first.message
++    assert getattr(agent, "_travel_controller_attempt_count", 0) == 0
++    assert agent._tool_guardrail_halt_decision is None
++
++    second = {"command": command}
++    assert before_agent_tool_call(agent, "terminal", second) is None
++    assert agent._travel_controller_attempt_count == 1
++
++
++def test_thin_manifest_runs_when_few_searches_remain(monkeypatch, tmp_path: Path):
++    agent, command = _breadth_turn(monkeypatch, tmp_path, {"attraction": 5, "restaurant": 2})
++    agent._travel_search_budget_turn_id = "turn-1"
++    agent._travel_search_query_count = 21
++
++    assert before_agent_tool_call(agent, "terminal", {"command": command}) is None
++    assert agent._travel_controller_attempt_count == 1
++
++
++def test_thin_manifest_runs_when_search_is_closed(monkeypatch, tmp_path: Path):
++    agent, command = _breadth_turn(monkeypatch, tmp_path, {"attraction": 5, "restaurant": 2})
++    agent._travel_search_wave_closed_turn_id = "turn-1"
++
++    assert before_agent_tool_call(agent, "terminal", {"command": command}) is None
++
++
++def test_full_manifest_runs_without_breadth_check(monkeypatch, tmp_path: Path):
++    agent, command = _breadth_turn(monkeypatch, tmp_path, {"attraction": 8, "restaurant": 8})
++
++    assert before_agent_tool_call(agent, "terminal", {"command": command}) is None
++    assert agent._travel_controller_attempt_count == 1
++
++
++def test_breadth_rejection_is_not_a_controller_failure_or_boundary():
++    import json as _json
++
++    from agent.research_contract import _travel_controller_result_failed
++    from agent.verified_tool_delivery import travel_research_controller_boundary
++
++    payload = _json.dumps(
++        {"error": "Not run yet", "status": "rejected", "code": "travel_discovery_breadth_short", "executed": False}
++    )
++    assert _travel_controller_result_failed(payload, False) is False
++    call = {
++        "id": "call-1",
++        "function": {
++            "name": "terminal",
++            "arguments": _json.dumps(
++                {"command": "python3 -m agent.research_harness.travel_runner /v/raw/travel/r.json", "timeout": 900}
++            ),
++        },
++    }
++    result = {"role": "tool", "tool_call_id": "call-1", "content": payload}
++    assert travel_research_controller_boundary([call], [result]) is False
++    failed = dict(result, content=_json.dumps({"output": "TRAVEL_RESEARCH_RUNNER_ERROR x", "exit_code": 2}))
++    assert travel_research_controller_boundary([call], [failed]) is True
+-- 
+2.53.0
+

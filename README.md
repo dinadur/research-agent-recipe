@@ -6,7 +6,7 @@ withholds rather than guesses. It is built on Nous Research's
 
 This repository is not a fork. It contains:
 
-- a 22-patch series against hermes-agent v0.21.3 that adds the research controller;
+- a 24-patch series against hermes-agent v0.21.3 that adds the research controller;
 - the receipt script that the agent's `reliable-research` skill runs;
 - two small HTTP adapters (a vLLM front end and a groundedness-judge front end);
 - end-to-end test tooling that drives the agent through Telegram from a real user account;

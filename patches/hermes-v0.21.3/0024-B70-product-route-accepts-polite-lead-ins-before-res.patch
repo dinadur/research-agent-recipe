@@ -1,0 +1,88 @@
+From 7e8b626fc4451c53ca50cca43e5b5d12a61bc2f8 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 16:53:06 +0000
+Subject: [PATCH 24/24] B70: product route accepts polite lead-ins before
+ "research"
+
+The product route armed only when a message began with "research". On
+2026-10-08 "Can you research the best options for a 55 inch TVs for a bright
+room around $1000" reached no research route: one fresh session tried
+parallel-research and was rejected, and another used the unrouted
+reliable-research skill (4 sources from 2 publishers). The prefix now also
+accepts "can/could/would/will you (please)", "please", "I'd like you to",
+"help me" and a leading "hey"/"hi". Across the 101 prompts in the Telegram
+canary suites, only that TV prompt changes route.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py            | 15 ++++++++++++++-
+ tests/agent/test_product_route.py | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index 083c8b8..9cfdbcf 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -120,7 +120,20 @@ PRODUCT_RESEARCH_CONTINUATION_NOTE = (
+     "different task.]"
+ )
+ 
+-_RESEARCH_PREFIX_RE = re.compile(r"^\s*research\b", re.IGNORECASE)
++# "Research ..." or a polite lead-in to it ("Can you research ...", "Could you
++# please research ...", "Please research ...", "I'd like you to research ...",
++# "Help me research ..."). Before 2026-10-08 only a leading "research" counted,
++# so a natural "Can you research the best options for a 55 inch TV ..." reached
++# no research route at all.
++_RESEARCH_PREFIX_RE = re.compile(
++    r"^\s*(?:(?:hey|hi)\b[\s,!]*)?"
++    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?"
++    r"|please\s+"
++    r"|i(?:'|\u2019)?d\s+like\s+you\s+to\s+|i\s+would\s+like\s+you\s+to\s+"
++    r"|help\s+me\s+)?"
++    r"research\b",
++    re.IGNORECASE,
++)
+ _DURABLE_COMPARISON_MODE_RE = re.compile(
+     r"(?im)^\s*mode\s*:\s*durable_comparison\s*$"
+ )
+diff --git a/tests/agent/test_product_route.py b/tests/agent/test_product_route.py
+index 90211cb..f1e52f0 100644
+--- a/tests/agent/test_product_route.py
++++ b/tests/agent/test_product_route.py
+@@ -4304,3 +4304,33 @@ def test_product_nonapproval_continuation_exposes_no_tools():
+ )
+ def test_product_publication_approval_is_explicit(text, approved):
+     assert product_publication_approval_requested(text) is approved
++
++
++@pytest.mark.parametrize(
++    "message",
++    [
++        "Can you research the best options for a 55 inch TVs for a bright room around $1000",
++        "Could you please research the best robot vacuum under $400 for pet hair",
++        "Please research the best noise cancelling headphones under $300",
++        "I'd like you to research the best espresso machine under $700",
++        "I’d like you to research the best espresso machine under $700",
++        "Help me research the best e-bike under $2000 for commuting",
++        "Hey, can you research the best budget laptop for students under $800",
++        "Research the best 55 inch TV for a bright room under $1000",
++    ],
++)
++def test_polite_research_lead_ins_select_the_product_route(message: str) -> None:
++    assert requires_product_research_route(message) is True
++
++
++@pytest.mark.parametrize(
++    "message",
++    [
++        "Can you tell me what research says about the best sleep schedule",
++        "What is the best TV under $1000? Research later.",
++        "I researched the best TVs under $1000 already",
++        "Can you research the history of the Eiffel Tower",
++    ],
++)
++def test_research_elsewhere_in_the_message_does_not_select_the_product_route(message: str) -> None:
++    assert requires_product_research_route(message) is False
+-- 
+2.53.0
+

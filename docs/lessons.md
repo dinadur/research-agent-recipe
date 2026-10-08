@@ -159,3 +159,15 @@ through the chat front end, not by unit tests.
     vLLM enforces a strict `json_schema` response format (a test schema forced an unnatural required key), so the
     reference controller v4 sends each review chunk with a schema for its exact keys, verdict values, identifiers
     and item count. Salvage of valid entries stays as a backstop.
+37. **Discovery stopped with half the searches unused** (0023). One run used 12 of 24 searches, wrote a 7-candidate
+    manifest and published 6; the controller only warned about breadth afterwards. The first controller call of a
+    turn now reads the manifest and, if it is short of the controller's own targets while at least 4 searches
+    remain, sends it back once with the counts. On its first live firing a 12-candidate manifest became 14 (12
+    published). Most runs search enough on their own and never see it.
+38. **Natural phrasing reached no research route** (0024). The product route required the message to start with
+    "research", and the generic route needs source wording, so "Can you research the best options for a 55 inch
+    TV ..." got no evidence controls: one session tried a delegation route and was rejected, another answered from
+    two publishers. Polite lead-ins now select the product route; across 101 canary prompts only that prompt
+    changed route. Test your routes with the phrasings people actually use, not just the ones in your suites.
+39. **A canary leaves the chat in its last session.** The canary signs in as the operator's chat account, so the
+    operator's next message landed in a travel-locked canary session. End each canary batch with `/new`.
