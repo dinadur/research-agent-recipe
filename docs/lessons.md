@@ -195,3 +195,15 @@ through the chat front end, not by unit tests.
     into one was refused or withheld. Rotate to a new session for a different research request, keep
     continuations in place, and tell the user how to /resume the old one. The rotation check must not add an await
     before the gateway claims the session: a race-guard test caught that.
+45. **Product publishing had never worked** (0029-0031). A test that replied "publish it" found three faults at
+    once. The publish command never received the session id; the publisher looked for a finish reason Hermes 0.21
+    no longer writes; and only neutral comparisons were publishable, so every "best X under $N" answer was
+    refused. The draft footer meanwhile said "publication requires a separate controlled step" without naming
+    it. Exercise every promised follow-up (approve, publish, "more") end to end, not just the first answer.
+46. **Recovery should do the step the model skips** (0032). After the one-shot repair round, most remaining
+    withholds still lacked the manufacturer page: the model spent the round on more reviews. The controller now
+    searches and extracts that page itself. Withholds are partly chance, too: the six withheld prompts all
+    delivered when re-run, without needing the new step.
+47. **The model can plan in the visible answer** (0033). About 1% of answers carried working notes ("Need maybe
+    ...", "Let's craft final ...") and earlier drafts before the real answer, and passed validation because they
+    cited the evidence. Keep the last clean draft, or reject.

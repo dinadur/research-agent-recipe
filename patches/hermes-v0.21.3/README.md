@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 28, in order, produced with `git format-patch`.
+- **Patches:** 33, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -31,8 +31,8 @@ Results on the published series:
 - that subset: 61 passed;
 - a wider research selection (13 test files, including product route, generic route, research contract, travel route
   and verified delivery): 511 passed, 2 skipped, 1 failed (0001-0018);
-- after 0019-0025, every test file matching product_route, generic_research, research_contract, travel_route,
-  verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files) plus the routing corpus: 598 passed,
+- after 0019-0033, every test file matching product_route, generic_research, research_contract, travel_route,
+  verified_tool, research_harness, research_loop, quality_first, groundedness or repair_fetch (15 files) plus the routing corpus, session-switch, publisher and busy-queue tests: 626 passed,
   1 skipped, with a pinned controller copy present.
 
 The one failure, `test_research_harness_travel_runner.py::test_installed_controller_matches_accepted_pin`, needs a
@@ -70,6 +70,11 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0026 | Queue messages during research turns; deliver batched travel previews | While a travel, product or generic research turn runs, a new message is queued instead of steered or interrupting (/stop and /new still cancel); a travel preview is delivered when other tool calls are batched with the one controller call |
 | 0027 | Product answers in plain language, 400-800 words | The quality-first synthesis prompt forbids internal words (packet, rows, controller, "the supplied evidence"), names sources by publisher, and targets 400-800 words (max 1,200) |
 | 0028 | A different research request starts a new session | In a travel- or product-locked session, a research request for another route (or a new product request) moves to a fresh session, idle or queued, with a /resume hint; continuations and approvals stay |
+| 0029 | Product publication result sent once | The publication result was streamed and also sent by the final send; it is now sent once |
+| 0030 | Publish verified product answers with their price date | `publish it` publishes any verified product answer: `--mode auto` keeps the durable-comparison rules and publishes other answers as commerce pages (re-checked by the quality-first gate, `prices_as_of` and a check-offers note, title from the request, dated file name); the command is bound to the session id and the deployed checkout |
+| 0031 | Product publisher finds drafts stored as text_response(...) | Hermes 0.21 stores the verified draft's exit as `text_response(product_research_verified_draft)`; without this no draft was ever found |
+| 0032 | Controller fetches the missing manufacturer page before withholding | After the repair round, a missing official page is searched and extracted by the controller once per turn, behind the repair-fetch switch |
+| 0033 | Drop leaked planning text from product answers | Working notes and earlier drafts before the final answer are cut; with no clean final draft the answer fails validation |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 

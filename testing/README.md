@@ -36,3 +36,17 @@ private context.
   questions.
 - `suites/product-20.json`: the 20 product prompts behind the published delivery numbers. `n01`-`n10` are named
   three-way comparisons and `o01`-`o10` are open-ended.
+
+## Task options
+
+Each suite task may also set:
+
+- `"footer": "none"` sends the prompt without the read-only footer (needed for travel requests, which must write
+  their manifest);
+- `"followup": {"after_seconds": 120, "text": "..."}` sends a second message while the first turn may still be
+  running, to test busy-input handling;
+- `"approval_followup": "yes" | "more" | "publish it"` replies once after the first answer settles. This is the
+  only way a canary approves anything: use it only where publishing test pages is acceptable.
+
+After the last task the canary sends `/new`, so your next real message starts in a clean session.
+

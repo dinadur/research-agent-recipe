@@ -1,0 +1,38 @@
+From a6f97ff9c95542bd86166d7bc3979fafb6fcfe88 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:09:45 +0000
+Subject: [PATCH] B70: product publication result sent once
+
+The product publication delivery pushed its message through
+stream_delta_callback and also left it for the gateway's final send, so
+Telegram showed PRODUCT_PUBLICATION_ERROR twice on 2026-10-09 (the second
+copy with the failed-turn footer). Deliver it once, as for travel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/research_loop.py | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/agent/research_loop.py b/agent/research_loop.py
+index 071f665..3c0a735 100644
+--- a/agent/research_loop.py
++++ b/agent/research_loop.py
+@@ -446,13 +446,9 @@ def after_research_tools(agent, s):
+         agent._session_messages = s.messages
+         agent._response_was_previewed = False
+         if s.final_response:
++            # Delivered once, by the gateway's final send (as for travel). Streaming
++            # it as well sent PRODUCT_PUBLICATION_ERROR twice on 2026-10-09.
+             agent._safe_print(f'\n{s.final_response}\n')
+-            if agent.stream_delta_callback:
+-                try:
+-                    agent.stream_delta_callback(s.final_response)
+-                    agent.stream_delta_callback(None)
+-                except Exception:
+-                    pass
+         return 'break'
+     if _travel_approval_delivery is not None:
+         s.final_response, _travel_failed = _travel_approval_delivery
+-- 
+2.53.0
+

@@ -1,0 +1,374 @@
+From 8adcbc8b23077737f4d8baa0bade1ff36da433c6 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:18:14 +0000
+Subject: [PATCH] B70: publish verified product answers with their price date
+
+On 2026-10-09 a "publish it" reply to a product answer failed with "current
+Hermes session identity is unavailable". The publisher also accepted only
+"mode: durable_comparison" requests without commerce claims, so ordinary
+"best X under $N" answers could never be published.
+
+- The publish command is now "--mode auto". At admission it is bound to the
+  session (HERMES_SESSION_ID=...) and to the deployed checkout (workdir), as
+  receipts and the travel runner are.
+- Auto mode keeps the durable rules for durable-comparison requests. Every
+  other verified answer publishes as a commerce page: it is re-checked with
+  the quality-first gate that delivered it, and stamped "prices_as_of: <draft
+  date>" with a note to check current offers. The title comes from the
+  request when the draft has no H1, and the file name carries the date.
+- The draft footer names the reply that publishes it: "publish it".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_publisher.py               | 103 +++++++++++++++++++----
+ agent/product_route.py                   |   2 +-
+ agent/research_contract.py               |  11 +++
+ agent/verified_tool_delivery.py          |  12 ++-
+ tests/agent/test_product_groundedness.py |   2 +-
+ tests/agent/test_product_publisher.py    |  64 ++++++++++++++
+ tests/agent/test_product_route.py        |  21 +++++
+ 7 files changed, 195 insertions(+), 20 deletions(-)
+
+diff --git a/agent/product_publisher.py b/agent/product_publisher.py
+index 2c7cdda..127047b 100644
+--- a/agent/product_publisher.py
++++ b/agent/product_publisher.py
+@@ -27,6 +27,10 @@ from agent.product_route import (
+ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+ DURABLE_MODE = "durable_comparison"
+ LEGACY_MODE = "legacy_product_research"
++# Ordinary product recommendations (prices, offers). Published with the date the
++# prices were researched; re-checked with the quality-first gate that delivered them.
++COMMERCE_MODE = "commerce"
++AUTO_MODE = "auto"
+ _DURABLE_REQUEST_RE = re.compile(
+     r"(?im)^\s*mode:\s*durable_comparison\s*$"
+ )
+@@ -217,11 +221,55 @@ def _validate_durable_boundary(original_request: str, draft: str) -> None:
+         )
+ 
+ 
+-def _render_page(title: str, draft: str, source_digest: str, draft_digest: str) -> bytes:
++_REQUEST_LEAD_RE = re.compile(
++    r"^\s*(?:(?:hey|hi)\b[\s,!]*)?"
++    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+|i(?:'|\u2019)?d\s+like\s+you\s+to\s+"
++    r"|i\s+would\s+like\s+you\s+to\s+|help\s+me\s+)?"
++    r"(?:research(?:\s+and\s+compare)?|find(?:\s+me)?|recommend|suggest|look\s+(?:into|for|up)|compare"
++    r"|what(?:'s|\u2019s|\s+is|\s+are|\s+would\s+be)|which\s+(?:is|are)|i\s+need|i(?:'m|\u2019m|\s+am)\s+looking\s+for)?"
++    r"\s*(?:the\s+|a\s+|an\s+)?",
++    re.IGNORECASE,
++)
++
++
++def _request_title(original_request: str) -> str | None:
++    """A page title from the operator's request ("What's the best X?" -> "Best X")."""
++
++    first = " ".join(str(original_request or "").split("\n", 1)[0].split())
++    text = _REQUEST_LEAD_RE.sub("", first, count=1).strip().rstrip("?.!").strip()
++    if len(text) < 8:
++        return None
++    return (text[0].upper() + text[1:])[:100].rstrip()
++
++
++def _draft_date(draft_row: Any) -> str:
++    """UTC date the draft (and its prices) was researched."""
++
++    try:
++        value = draft_row["timestamp"]
++    except (KeyError, IndexError, TypeError):
++        value = None
++    try:
++        return dt.datetime.fromtimestamp(float(value), dt.timezone.utc).date().isoformat()
++    except (TypeError, ValueError, OverflowError, OSError):
++        try:
++            return dt.date.fromisoformat(str(value)[:10]).isoformat()
++        except ValueError:
++            return dt.datetime.now(dt.timezone.utc).date().isoformat()
++
++
++def _render_page(
++    title: str, draft: str, source_digest: str, draft_digest: str, *, prices_as_of: str | None = None
++) -> bytes:
+     stripped = draft.strip()
+     if not stripped.endswith(PRODUCT_RESEARCH_PUBLICATION_FOOTER):
+         raise PublicationError("verified draft is missing the draft-only boundary")
+     body = stripped[: -len(PRODUCT_RESEARCH_PUBLICATION_FOOTER)].rstrip()
++    if prices_as_of:
++        body = (
++            f"> Prices and availability as of {prices_as_of}. They change often: check current "
++            "offers before buying.\n\n" + body
++        )
+     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+     rendered = (
+         "---\n"
+@@ -232,7 +280,8 @@ def _render_page(title: str, draft: str, source_digest: str, draft_digest: str)
+         "  - product-research\n"
+         f"source_receipt_sha256: {source_digest}\n"
+         f"verified_draft_sha256: {draft_digest}\n"
+-        "---\n\n"
++        + (f"prices_as_of: {prices_as_of}\n" if prices_as_of else "")
++        + "---\n\n"
+         f"{body}\n"
+     )
+     return rendered.encode("utf-8")
+@@ -302,28 +351,48 @@ def publish_product_research(
+     original_request = _load_original_request(
+         resolved_home, session_id, turn_user_message_id
+     )
++    if mode == AUTO_MODE:
++        mode = DURABLE_MODE if _DURABLE_REQUEST_RE.search(original_request) else COMMERCE_MODE
+     if mode == DURABLE_MODE:
+         _validate_durable_boundary(original_request, draft)
+-    elif mode != LEGACY_MODE:
++    elif mode not in (LEGACY_MODE, COMMERCE_MODE):
+         raise PublicationError("unsupported product publication mode")
+-    source_texts = _load_source_texts(
+-        resolved_home,
+-        session_id,
+-        turn_user_message_id,
+-        int(draft_row["id"]),
+-        source_urls,
+-    )
+-    passed, validated_draft, reason = validate_product_research_text(
+-        draft, source_urls, source_texts, original_request
+-    )
+-    if not passed or validated_draft.strip() != draft:
+-        raise PublicationError(f"verified draft failed current publication gate: {reason}")
++    prices_as_of: str | None = None
++    if mode == COMMERCE_MODE:
++        from agent.quality_first_route import response_diagnostics
++
++        body = draft
++        if body.endswith(PRODUCT_RESEARCH_PUBLICATION_FOOTER):
++            body = body[: -len(PRODUCT_RESEARCH_PUBLICATION_FOOTER)].rstrip()
++        diagnostics = response_diagnostics(body, original_request, source_urls)
++        if not diagnostics.get("passed"):
++            defects = ",".join(str(d) for d in diagnostics.get("defects") or []) or "validation_failed"
++            raise PublicationError(f"verified draft failed current publication gate: {defects}")
++        prices_as_of = _draft_date(draft_row)
++    else:
++        source_texts = _load_source_texts(
++            resolved_home,
++            session_id,
++            turn_user_message_id,
++            int(draft_row["id"]),
++            source_urls,
++        )
++        passed, validated_draft, reason = validate_product_research_text(
++            draft, source_urls, source_texts, original_request
++        )
++        if not passed or validated_draft.strip() != draft:
++            raise PublicationError(f"verified draft failed current publication gate: {reason}")
+     title = product_research_title(draft)
++    if title is None and mode == COMMERCE_MODE:
++        title = _request_title(original_request)
+     if title is None:
+         raise PublicationError("verified draft title is missing")
+     slug = _slugify(title)
++    if mode == COMMERCE_MODE and prices_as_of:
++        # Prices date a commerce page; a later re-research gets its own page.
++        slug = f"{slug[:89].rstrip('-')}-{prices_as_of}"
+     draft_digest = hashlib.sha256(draft.encode("utf-8")).hexdigest()
+-    page_payload = _render_page(title, draft, source_digest, draft_digest)
++    page_payload = _render_page(title, draft, source_digest, draft_digest, prices_as_of=prices_as_of)
+     page_digest = _sha256_bytes(page_payload)
+ 
+     products = resolved_vault / "products"
+@@ -405,7 +474,7 @@ def publish_product_research(
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--mode", choices=[DURABLE_MODE], required=True)
++    parser.add_argument("--mode", choices=[DURABLE_MODE, AUTO_MODE], required=True)
+     args = parser.parse_args()
+     home_text = os.environ.get("HERMES_HOME", "").strip()
+     vault_text = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
+diff --git a/agent/product_route.py b/agent/product_route.py
+index 285d00b..fd1531d 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -33,7 +33,7 @@ PRODUCT_RESEARCH_CANDIDATE_PLACEHOLDER = (
+ )
+ PRODUCT_RESEARCH_PUBLICATION_FOOTER = (
+     "Publication status: Draft only—nothing was written to the wiki. "
+-    "Publication requires a separate controlled step."
++    "Reply `publish it` to save it to the wiki."
+ )
+ PRODUCT_RESEARCH_FIRST_RESPONSE_TIMEOUT_ENV = (
+     "HERMES_PRODUCT_RESEARCH_FIRST_RESPONSE_TIMEOUT_SECONDS"
+diff --git a/agent/research_contract.py b/agent/research_contract.py
+index 860481e..a2f905e 100644
+--- a/agent/research_contract.py
++++ b/agent/research_contract.py
+@@ -5366,6 +5366,17 @@ def before_agent_tool_call(
+                     retryable=False,
+                     executed=False,
+                 )
++            from agent.verified_tool_delivery import (
++                PRODUCT_RESEARCH_PUBLISH_COMMAND,
++                bound_product_publish_command,
++            )
++
++            if isinstance(args, dict) and args.get("command") == PRODUCT_RESEARCH_PUBLISH_COMMAND:
++                # The publisher reads the session from HERMES_SESSION_ID and is a
++                # module of this checkout: bind both (2026-10-09: every publish
++                # failed with "current Hermes session identity is unavailable").
++                args["command"] = bound_product_publish_command(str(getattr(agent, "session_id", "") or ""))
++                args["workdir"] = str(DEPLOYED_HERMES_ROOT)
+     if generic_research_route_active(agent):
+         source_budget_rejection = generic_research_source_budget_rejection(
+             agent, tool_name, args
+diff --git a/agent/verified_tool_delivery.py b/agent/verified_tool_delivery.py
+index 1380e16..1a1997d 100644
+--- a/agent/verified_tool_delivery.py
++++ b/agent/verified_tool_delivery.py
+@@ -43,6 +43,15 @@ def bound_generic_research_receipt_command(session_id: str) -> str:
+     )
+ 
+ 
++def bound_product_publish_command(session_id: str) -> str:
++    """The product publisher command bound to one safe session (the terminal tool
++    does not export HERMES_SESSION_ID, so the unbound command always failed)."""
++
++    if not isinstance(session_id, str) or not _RECEIPT_SESSION_ID_RE.fullmatch(session_id):
++        raise ValueError("invalid Hermes session id for publisher binding")
++    return f"HERMES_SESSION_ID={session_id} {PRODUCT_RESEARCH_PUBLISH_COMMAND}"
++
++
+ def bound_product_research_receipt_command(session_id: str) -> str:
+     """Return the product-controller receipt command bound to one safe session."""
+ 
+@@ -111,7 +120,7 @@ def is_generic_research_receipt_command(command: Any) -> bool:
+ 
+     return generic_research_receipt_command_allowed(command)
+ PRODUCT_RESEARCH_PUBLISH_COMMAND = (
+-    "python3 -m agent.product_publisher --mode durable_comparison"
++    "python3 -m agent.product_publisher --mode auto"
+ )
+ TRAVEL_RESEARCH_CONTROLLER_SCRIPTS = frozenset(
+     {
+@@ -598,6 +607,7 @@ __all__ = [
+     "GENERIC_RESEARCH_RECEIPT_COMMANDS",
+     "GENERIC_RESEARCH_RECEIPT_ABSOLUTE_COMMAND",
+     "PRODUCT_RESEARCH_PUBLISH_COMMAND",
++    "bound_product_publish_command",
+     "RELIABLE_RESEARCH_COMMAND",
+     "TRAVEL_RESEARCH_CONTROLLER_SCRIPTS",
+     "TRAVEL_RESEARCH_RUNNER_MODULE",
+diff --git a/tests/agent/test_product_groundedness.py b/tests/agent/test_product_groundedness.py
+index ba14a21..829e898 100644
+--- a/tests/agent/test_product_groundedness.py
++++ b/tests/agent/test_product_groundedness.py
+@@ -198,7 +198,7 @@ _SHADOW_ANSWER = """## Conclusion
+ The Acme page lists **$299.99** and up to 30-hour battery life [Acme page](https://acme.example/x1). It is great value. The guide says it does not fold [Guide](https://guide.example/best), [Acme page](https://acme.example/x1).
+ - Plain uncited bullet with no link at all.
+ 
+-Publication status: Draft only—nothing was written to the wiki. Publication requires a separate controlled step.
++Publication status: Draft only—nothing was written to the wiki. Reply `publish it` to save it to the wiki.
+ """
+ 
+ 
+diff --git a/tests/agent/test_product_publisher.py b/tests/agent/test_product_publisher.py
+index d8a1a4d..5621eba 100644
+--- a/tests/agent/test_product_publisher.py
++++ b/tests/agent/test_product_publisher.py
+@@ -312,3 +312,67 @@ def test_durable_publisher_rejects_commerce_claims(tmp_path):
+             audit_vault=False,
+             mode=DURABLE_MODE,
+         )
++
++
++COMMERCE_REQUEST = "What's the best cordless vacuum under $600 for hardwood floors?"
++
++
++def _commerce_draft() -> str:
++    body = (
++        f"**Best pick: Vendor A.** It had strong pickup on hardwood floors in [Review One's test]({REVIEW_ONE}), "
++        f"and [the vendor's product page]({OFFICIAL}) notes that runtime varies by mode and floor type.\n\n"
++        f"- **Vendor A:** strong pickup and a higher price ([Review One]({REVIEW_ONE})).\n"
++        f"- **Vendor B:** lower price with shorter runtime ([Review Two]({REVIEW_TWO})).\n\n"
++        f"Caveat: runtime varies by mode and floor type ([vendor page]({OFFICIAL}))."
++    )
++    return f"{body}\n\n{PRODUCT_RESEARCH_PUBLICATION_FOOTER}"
++
++
++def test_auto_mode_publishes_a_commerce_answer_with_its_price_date(tmp_path):
++    from agent.product_publisher import AUTO_MODE
++
++    home = tmp_path / "home"
++    vault = tmp_path / "vault"
++    vault.mkdir()
++    _setup(home, draft=_commerce_draft(), approval="publish it", request=COMMERCE_REQUEST)
++
++    target, _receipt, _page_digest, _publication_digest = publish_product_research(
++        home=home, vault=vault, session_id=SESSION_ID, audit_vault=False, mode=AUTO_MODE,
++    )
++
++    assert target == vault / "products" / "best-cordless-vacuum-under-600-for-hardwood-floors-1970-01-01.md"
++    page = target.read_text(encoding="utf-8")
++    assert 'title: "Best cordless vacuum under $600 for hardwood floors"' in page
++    assert "prices_as_of: 1970-01-01" in page
++    assert "> Prices and availability as of 1970-01-01." in page
++    assert PRODUCT_RESEARCH_PUBLICATION_FOOTER not in page
++
++
++def test_auto_mode_rejects_a_commerce_draft_that_fails_the_quality_first_gate(tmp_path):
++    from agent.product_publisher import AUTO_MODE
++
++    home = tmp_path / "home"
++    vault = tmp_path / "vault"
++    vault.mkdir()
++    uncited = f"Best pick: Vendor A. It is great.\n\n{PRODUCT_RESEARCH_PUBLICATION_FOOTER}"
++    _setup(home, draft=uncited, approval="publish it", request=COMMERCE_REQUEST)
++
++    with pytest.raises(PublicationError, match="current publication gate"):
++        publish_product_research(
++            home=home, vault=vault, session_id=SESSION_ID, audit_vault=False, mode=AUTO_MODE,
++        )
++    assert not (vault / "products").exists()
++
++
++def test_auto_mode_keeps_durable_rules_for_durable_requests(tmp_path):
++    from agent.product_publisher import AUTO_MODE
++
++    home = tmp_path / "home"
++    vault = tmp_path / "vault"
++    vault.mkdir()
++    _setup(home, draft=_commerce_draft(), approval="publish it", request=DURABLE_REQUEST)
++
++    with pytest.raises(PublicationError):
++        publish_product_research(
++            home=home, vault=vault, session_id=SESSION_ID, audit_vault=False, mode=AUTO_MODE,
++        )
+diff --git a/tests/agent/test_product_route.py b/tests/agent/test_product_route.py
+index 32b9e48..e2a9a11 100644
+--- a/tests/agent/test_product_route.py
++++ b/tests/agent/test_product_route.py
+@@ -4333,3 +4333,24 @@ def test_polite_research_lead_ins_select_the_product_route(message: str) -> None
+ )
+ def test_research_elsewhere_in_the_message_does_not_select_the_product_route(message: str) -> None:
+     assert requires_product_research_route(message) is False
++
++
++def test_publish_command_is_bound_to_the_session_and_deployed_checkout():
++    from agent.research_contract import DEPLOYED_HERMES_ROOT
++
++    agent = SimpleNamespace(
++        session_id="session-123",
++        _current_turn_id="approval-turn",
++        _product_research_route_turn_id="approval-turn",
++        _product_research_initial_turn_id=None,
++        _product_research_route_session_latched=True,
++        _product_research_route_session_id="session-123",
++        _product_research_publication_approval_turn_id="approval-turn",
++        _parallel_research_terminal_quarantine_latched=False,
++    )
++    history = [{"role": "user", "content": PROMPT}]
++    assert arm_product_research_session(agent, "publish it", history)
++    args = {"command": PRODUCT_RESEARCH_PUBLISH_COMMAND, "timeout": 30}
++    assert before_agent_tool_call(agent, "terminal", args) is None
++    assert args["command"] == f"HERMES_SESSION_ID=session-123 {PRODUCT_RESEARCH_PUBLISH_COMMAND}"
++    assert args["workdir"] == str(DEPLOYED_HERMES_ROOT)
+-- 
+2.53.0
+

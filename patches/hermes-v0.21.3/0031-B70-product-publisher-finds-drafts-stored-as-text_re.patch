@@ -1,0 +1,75 @@
+From b2718ada42229541bcab0d54ed8fe1da0b0e9cf8 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:24:50 +0000
+Subject: [PATCH] B70: product publisher finds drafts stored as
+ text_response(...)
+
+Hermes stores a verified product turn's exit as finish_reason
+"text_response(product_research_verified_draft)". The publisher matched only
+the bare "product_research_verified_draft", so every publish on this stack
+answered "no controller-verified product draft exists" (2026-10-09). Accept
+both forms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_publisher.py            |  6 +++++-
+ tests/agent/test_product_publisher.py | 22 ++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/agent/product_publisher.py b/agent/product_publisher.py
+index 127047b..97ec797 100644
+--- a/agent/product_publisher.py
++++ b/agent/product_publisher.py
+@@ -66,6 +66,9 @@ def _slugify(value: str) -> str:
+     return slug
+ 
+ 
++# Hermes 0.21 stores the turn's exit as finish_reason
++# "text_response(product_research_verified_draft)"; only the bare form was
++# matched before, so no draft was ever found (2026-10-09).
+ def _read_session_rows(
+     home: Path, session_id: str
+ ) -> tuple[sqlite3.Row, sqlite3.Row]:
+@@ -85,7 +88,8 @@ def _read_session_rows(
+             FROM messages
+             WHERE session_id = ? AND role = 'assistant'
+               AND (tool_name = 'product_research_verified_draft'
+-                   OR finish_reason = 'product_research_verified_draft')
++                   OR finish_reason IN ('product_research_verified_draft',
++                                        'text_response(product_research_verified_draft)'))
+             ORDER BY id DESC
+             LIMIT 1
+             """,
+diff --git a/tests/agent/test_product_publisher.py b/tests/agent/test_product_publisher.py
+index 5621eba..a328c9e 100644
+--- a/tests/agent/test_product_publisher.py
++++ b/tests/agent/test_product_publisher.py
+@@ -376,3 +376,25 @@ def test_auto_mode_keeps_durable_rules_for_durable_requests(tmp_path):
+         publish_product_research(
+             home=home, vault=vault, session_id=SESSION_ID, audit_vault=False, mode=AUTO_MODE,
+         )
++
++
++def test_publisher_finds_a_draft_stored_with_the_text_response_finish_reason(tmp_path):
++    from agent.product_publisher import AUTO_MODE
++
++    home = tmp_path / "home"
++    vault = tmp_path / "vault"
++    vault.mkdir()
++    _setup(home, draft=_commerce_draft(), approval="publish it", request=COMMERCE_REQUEST)
++    database = sqlite3.connect(home / "state.db")
++    database.execute(
++        "UPDATE messages SET tool_name = NULL, finish_reason = "
++        "'text_response(product_research_verified_draft)' WHERE id = 3"
++    )
++    database.commit()
++    database.close()
++
++    target, *_ = publish_product_research(
++        home=home, vault=vault, session_id=SESSION_ID, audit_vault=False, mode=AUTO_MODE,
++    )
++    assert target.is_file()
++
+-- 
+2.53.0
+

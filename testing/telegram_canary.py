@@ -9,8 +9,12 @@ Safety rules built in:
     (TELEGRAM_CANARY_PEER plus its numeric TELEGRAM_CANARY_PEER_ID; the resolved peer must be a bot).
   * Every task starts a fresh session ("/new canary-<task-id>") unless "fresh_session" is false.
   * A read-only safety footer is appended to every prompt.
-  * Approval-like prompts ("yes", "approve", "publish it", ...) are refused at load time, so a canary can never
-    approve a pending action.
+  * Approval-like prompts ("yes", "approve", "publish it", ...) are refused at load time. The only way a canary
+    replies to an approval prompt is an explicit per-task "approval_followup" ("yes", "more" or "publish it"),
+    sent once after the first reply has settled. Use it only where publishing test pages is acceptable.
+  * A per-task "followup" ({"after_seconds": N, "text": ...}) sends a second message while the first turn may
+    still be running, to test busy-input handling. It is subject to the same approval-prompt check.
+  * After the last task the client sends "/new", so the operator's next real message starts a clean session.
   * It refuses to run as root, and requires the Telethon session file to be mode 0600.
 
 Completion of a task = the gateway was seen active and returned to idle (read from Hermes' gateway_state.json),
@@ -97,9 +101,29 @@ def load_suite(path: pathlib.Path) -> list[dict[str, Any]]:
             raise ValueError(f"task {task_id} has no prompt")
         if re.sub(r"[^a-z' ]+", "", prompt.casefold()).strip() in FORBIDDEN_STANDALONE_PROMPTS:
             raise ValueError(f"task {task_id} is an approval-like prompt and is forbidden")
+        followup = row.get("followup")
+        if followup is not None:
+            text = str(followup.get("text", "")).strip() if isinstance(followup, dict) else ""
+            after = int(followup.get("after_seconds", 0)) if isinstance(followup, dict) else 0
+            if not text or not 10 <= after <= 1800:
+                raise ValueError(f"task {task_id} followup needs text and after_seconds 10-1800")
+            if re.sub(r"[^a-z' ]+", "", text.casefold()).strip() in FORBIDDEN_STANDALONE_PROMPTS:
+                raise ValueError(f"task {task_id} followup is an approval-like prompt and is forbidden")
+            followup = {"text": text, "after_seconds": after}
+        approval = row.get("approval_followup")
+        if approval is not None and approval not in {"yes", "more", "publish it"}:
+            raise ValueError(f"task {task_id} approval_followup must be yes, more or publish it")
+        footer = str(row.get("footer", "read_only"))
+        if footer not in {"read_only", "none"}:
+            raise ValueError(f"task {task_id} footer must be read_only or none")
         tasks.append({
             "id": task_id,
             "prompt": prompt,
+            "followup": followup,
+            "approval_followup": approval,
+            # "none" sends the prompt unchanged: travel requests must write their manifest, and a footer that
+            # forbids writes would switch the travel route off.
+            "footer": footer,
             "expected_exact": row.get("expected_exact"),
             "minimum_response_chars": max(1, min(10000, int(row.get("minimum_response_chars", 1)))),
             "timeout_seconds": max(30, min(7200, int(row.get("timeout_seconds", 900)))),
@@ -152,6 +176,33 @@ def delivery_signature(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(reduced).encode()).hexdigest()
 
 
+async def wait_for_reply(client, peer, after_id, gateway_state, timeout, poll_seconds, settle_seconds,
+                         followup_state=None, require_activity=True):
+    """Wait until the gateway was active, returned to idle, and delivery stopped changing."""
+    start = time.monotonic()
+    active_seen = idle_after_active = False
+    last_signature, last_change, final_rows, status = "", start, [], "timeout"
+    while time.monotonic() < start + timeout:
+        if followup_state is not None and not followup_state.get("sent"):
+            active_seen = idle_after_active = False  # not complete before the follow-up is out
+        gw = gateway_status(gateway_state)
+        active = gw.get("active_agents")
+        if isinstance(active, int) and active > 0:
+            active_seen = True
+        if active_seen and active == 0:
+            idle_after_active = True
+        rows = await incoming_after(client, peer, after_id)
+        signature = delivery_signature(rows)
+        if signature != last_signature:
+            last_signature, last_change, final_rows = signature, time.monotonic(), rows
+        complete = idle_after_active or (not require_activity and active == 0)
+        if complete and rows and time.monotonic() - last_change >= settle_seconds:
+            status = "pass"
+            break
+        await asyncio.sleep(poll_seconds)
+    return status, final_rows, active_seen, idle_after_active
+
+
 async def run_task(client, peer, task, task_dir, gateway_state, poll_seconds, settle_seconds) -> dict[str, Any]:
     await wait_gateway_idle(gateway_state, 120)
     if task["fresh_session"]:
@@ -163,28 +214,24 @@ async def run_task(client, peer, task, task_dir, gateway_state, poll_seconds, se
             await asyncio.sleep(1)
         await wait_gateway_idle(gateway_state, 120)
 
-    sent_text = f"{task['prompt']}\n\n{READ_ONLY_FOOTER}"
+    sent_text = task["prompt"] if task["footer"] == "none" else f"{task['prompt']}\n\n{READ_ONLY_FOOTER}"
     (task_dir / "prompt-sent.md").write_text(sent_text + "\n", encoding="utf-8")
     sent = await client.send_message(peer, sent_text)
     sent_utc, start = utc_now(), time.monotonic()
-    active_seen = idle_after_active = False
-    last_signature, last_change, final_rows, status = "", start, [], "timeout"
-    while time.monotonic() < start + task["timeout_seconds"]:
-        gw = gateway_status(gateway_state)
-        active = gw.get("active_agents")
-        if isinstance(active, int) and active > 0:
-            active_seen = True
-        if active_seen and active == 0:
-            idle_after_active = True
-        rows = await incoming_after(client, peer, int(sent.id))
-        signature = delivery_signature(rows)
-        if signature != last_signature:
-            last_signature, last_change, final_rows = signature, time.monotonic(), rows
-        complete = idle_after_active or (not task["require_gateway_activity"] and active == 0)
-        if complete and rows and time.monotonic() - last_change >= settle_seconds:
-            status = "pass"
-            break
-        await asyncio.sleep(poll_seconds)
+    followup_state = {} if task["followup"] else None
+
+    async def send_followup():
+        await asyncio.sleep(task["followup"]["after_seconds"])
+        message = await client.send_message(peer, task["followup"]["text"])
+        followup_state.update(sent=True, id=int(message.id), sent_utc=utc_now())
+        write_json(task_dir / "followup-sent.json", followup_state)
+
+    followup_job = asyncio.create_task(send_followup()) if task["followup"] else None
+    status, final_rows, active_seen, idle_after_active = await wait_for_reply(
+        client, peer, int(sent.id), gateway_state, task["timeout_seconds"], poll_seconds, settle_seconds,
+        followup_state, task["require_gateway_activity"])
+    if followup_job is not None and not followup_job.done():
+        followup_job.cancel()
 
     response = "\n\n".join(r["text"] for r in final_rows).strip()
     exact = None if task["expected_exact"] is None else response == task["expected_exact"]
@@ -195,6 +242,13 @@ async def run_task(client, peer, task, task_dir, gateway_state, poll_seconds, se
         status, reason = "fail", "exact_mismatch"
     (task_dir / "response.md").write_text(response + "\n", encoding="utf-8")
     write_json(task_dir / "telegram-messages.json", final_rows)
+    if task["approval_followup"] and status == "pass":
+        await asyncio.sleep(settle_seconds)
+        approval = await client.send_message(peer, task["approval_followup"])
+        a_status, a_rows, _seen, _idle = await wait_for_reply(
+            client, peer, int(approval.id), gateway_state, task["timeout_seconds"], poll_seconds, settle_seconds)
+        write_json(task_dir / "approval.json", {"text": task["approval_followup"], "status": a_status,
+                                                "messages": a_rows})
     row = {"id": task["id"], "status": status, "failure_reason": reason, "sent_utc": sent_utc,
            "elapsed_seconds": round(time.monotonic() - start, 1), "response_chars": len(response),
            "response_sha256": sha256_text(response), "exact_match": exact,
@@ -241,6 +295,12 @@ async def async_main(args: argparse.Namespace) -> int:
             if result["status"] != "pass" and not task["continue_on_failure"]:
                 break
             await asyncio.sleep(args.cooldown_seconds)
+        # Leave the operator's chat in a fresh session, not in the last canary's.
+        try:
+            await wait_gateway_idle(args.gateway_state, 120)
+            await client.send_message(peer, "/new")
+        except Exception as exc:  # recorded, never fails the batch
+            print(json.dumps({"closing_new": "failed", "error": type(exc).__name__}))
     finally:
         await client.disconnect()
     summary = {"kind": "hermes-telegram-read-only-canary", "started_utc": started, "completed_utc": utc_now(),

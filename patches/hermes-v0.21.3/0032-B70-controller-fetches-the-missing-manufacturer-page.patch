@@ -1,0 +1,251 @@
+From d69e0c7b4b420f5b0aa4a08b207442864e767430 Mon Sep 17 00:00:00 2001
+From: dinadur <59811564+dinadur@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 16:32:21 +0000
+Subject: [PATCH] B70: controller fetches the missing manufacturer page before
+ withholding
+
+Between 2026-10-08 and 10-09, 9 product requests were withheld after the
+repair round. Of the 6 that failed after a granted repair, 4 still lacked
+the candidate's manufacturer page: the model spent the repair on more
+reviews, or did not search.
+
+When the repair round is spent and official_product_evidence_missing is
+among the viability reasons, the controller now fetches the page itself,
+once per turn and behind the same switch as the repair fetch:
+1. The premature receipt call becomes a web_search for the leading
+   candidate's name, in the model's own words plus the brand from a site:
+   scope, followed by "official product page".
+2. The next call, whatever the model asked, becomes a web_extract of up to
+   two results on a host the query names, never review, retailer or
+   editorial pages.
+3. Viability is then judged as usual; still unready means withheld.
+
+The turn's search and extract limits grow by one each for these two calls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/product_route.py                   | 124 ++++++++++++++++++++++-
+ tests/agent/test_product_repair_fetch.py |  51 ++++++++++
+ 2 files changed, 171 insertions(+), 4 deletions(-)
+
+diff --git a/agent/product_route.py b/agent/product_route.py
+index fd1531d..b5b3dcb 100644
+--- a/agent/product_route.py
++++ b/agent/product_route.py
+@@ -695,13 +695,83 @@ def _product_research_repair_fetch_enabled() -> bool:
+ 
+ 
+ def _product_research_repair_bonus(agent: Any) -> int:
+-    """Extra search/extract calls granted to the current turn (0 or 1)."""
++    """Extra search/extract calls granted to the current turn (0-2): one for the
++    model's repair round, one for the controller's official-page fetch."""
+ 
+     turn_id = getattr(agent, "_current_turn_id", None)
++    if not turn_id:
++        return 0
+     return int(
+-        bool(turn_id)
+-        and getattr(agent, "_product_research_repair_grant_turn_id", None) == turn_id
+-    )
++        getattr(agent, "_product_research_repair_grant_turn_id", None) == turn_id
++    ) + int(getattr(agent, "_product_research_official_fetch_turn_id", None) == turn_id)
++
++
++_OFFICIAL_FETCH_QUERY_SUFFIX = "official product page"
++
++
++def _product_official_fetch_query(mix: Mapping[str, Any]) -> str | None:
++    """The leading candidate's name, in the model's own words, plus "official product page"."""
++
++    tokens = {t for t in mix.get("candidate_tokens", set()) if isinstance(t, str)}
++    query = str(mix.get("candidate_query") or "")
++    if not tokens or not query:
++        return None
++    words: list[str] = []
++    seen: set[str] = set()
++    # A site-scoped candidate search names the brand only in its scope
++    # ("site:roborock.com q5 max plus"); keep that identity in the new query.
++    for scoped in re.findall(r"\bsite:([^\s]+)", query, re.IGNORECASE):
++        identity = _product_host_identity_token(f"https://{scoped.strip('/')}")
++        if identity and identity not in seen:
++            seen.add(identity)
++            words.append(identity)
++    query = re.sub(r"\bsite:[^\s]+", " ", query, flags=re.IGNORECASE)
++    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", query):
++        token = _normalized_token(word)
++        if token in tokens and token not in seen:
++            seen.add(token)
++            words.append(word)
++    if len(words) < 2:
++        return None
++    return f"{' '.join(words)} {_OFFICIAL_FETCH_QUERY_SUFFIX}"
++
++
++def _product_official_fetch_extract(
++    agent: Any, calls: list[Any], current_messages: list[Mapping[str, Any]]
++) -> tuple[list[Any], str | None, dict[str, Any] | None] | None:
++    """Second step of the controller's official-page fetch: extract its search result."""
++
++    turn_id = getattr(agent, "_current_turn_id", None)
++    pending = getattr(agent, "_product_research_official_fetch_pending", None)
++    if not calls or not isinstance(pending, tuple) or pending[:2] != (turn_id, "search"):
++        return None
++    query = pending[2]
++    agent._product_research_official_fetch_pending = None
++    picks: list[str] = []
++    for record_query, urls in _product_search_query_records(current_messages):
++        if " ".join(str(record_query).split()) != query:
++            continue
++        for value in urls:
++            url = _safe_product_recovery_url(value)
++            if (
++                url is not None
++                and not _product_url_never_official(url)
++                and _product_query_targets_source_host(query, url)
++                and url not in picks
++            ):
++                picks.append(url)
++    if not picks:
++        logger.info(
++            "Product research controller official fetch found no manufacturer URL for %r session=%s",
++            query, getattr(agent, "session_id", None) or "none",
++        )
++        return None
++    agent._product_research_search_budget_exhausted_turn_id = None
++    agent._product_research_extract_budget_exhausted_turn_id = None
++    function = getattr(calls[0], "function", None)
++    function.name = "web_extract"
++    function.arguments = json.dumps({"urls": picks[:2]}, ensure_ascii=False, separators=(",", ":"))
++    return [calls[0]], None, {"mode": "controller_official_extract", "urls": picks[:2]}
+ 
+ 
+ def _product_research_durable_comparison_mode(original_request: Any) -> bool:
+@@ -2887,6 +2957,15 @@ def prepare_product_research_source_mix(
+     """
+ 
+     calls = list(tool_calls) if isinstance(tool_calls, (list, tuple)) else []
++    if (
++        product_research_initial_turn_active(agent)
++        and isinstance(messages, (list, tuple))
++    ):
++        fetched = _product_official_fetch_extract(
++            agent, calls, _product_current_turn_messages(messages)
++        )
++        if fetched is not None:
++            return fetched
+     parallel_terminal_calls = len(calls) > 1 and all(
+         _product_tool_call_name_arguments(call)[0] == "terminal" for call in calls
+     )
+@@ -3250,6 +3329,43 @@ def prepare_product_research_source_mix(
+                     "extract_calls": extract_count,
+                 },
+             )
++        official_query = _product_official_fetch_query(mix)
++        if (
++            _product_research_repair_fetch_enabled()
++            and "official_product_evidence_missing" in viability_reasons
++            and official_query is not None
++            and isinstance(turn_id, str)
++            and turn_id
++            and getattr(agent, "_product_research_official_fetch_turn_id", None) != turn_id
++        ):
++            # The repair round is spent and the manufacturer page is still missing
++            # (4 of 6 post-repair withholds on 2026-10-08/09). Fetch it for the
++            # model: search the candidate's official page now, extract it next.
++            agent._product_research_official_fetch_turn_id = turn_id
++            agent._product_research_official_fetch_pending = (turn_id, "search", official_query)
++            agent._product_research_search_budget_exhausted_turn_id = None
++            agent._product_research_extract_budget_exhausted_turn_id = None
++            function = getattr(calls[0], "function", None)
++            function.name = "web_search"
++            function.arguments = json.dumps(
++                {"query": official_query, "limit": 5}, ensure_ascii=False, separators=(",", ":")
++            )
++            logger.info(
++                "Product research controller official fetch: query=%r reasons=%s session=%s",
++                official_query, ",".join(viability_reasons),
++                getattr(agent, "session_id", None) or "none",
++            )
++            return (
++                [calls[0]],
++                None,
++                {
++                    "mode": "controller_official_search",
++                    "query": official_query,
++                    "viability_reasons": list(viability_reasons),
++                    "search_calls": search_count,
++                    "extract_calls": extract_count,
++                },
++            )
+         agent._product_research_receipt_viability_failure_turn_id = turn_id
+         agent._product_research_receipt_viability_failure_reasons = tuple(
+             viability_reasons
+diff --git a/tests/agent/test_product_repair_fetch.py b/tests/agent/test_product_repair_fetch.py
+index 6ac5a89..b01a1bf 100644
+--- a/tests/agent/test_product_repair_fetch.py
++++ b/tests/agent/test_product_repair_fetch.py
+@@ -75,6 +75,8 @@ def test_second_unready_receipt_in_the_same_turn_is_withheld(monkeypatch):
+     monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
+     agent, messages, receipt = _exhausted_scenario()
+     prepare_product_research_source_mix(agent, [receipt], messages)
++    # The controller's official-page fetch is the second (and last) recovery.
++    agent._product_research_official_fetch_turn_id = "turn-1"
+ 
+     calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
+ 
+@@ -374,3 +376,52 @@ def test_no_repair_rewrite_without_a_granted_round(monkeypatch):
+     messages = messages + _search_messages("q", ["https://www.rtings.com/x"], "3")
+     calls, nudge, details = prepare_product_research_source_mix(agent, [receipt], messages)
+     assert details["mode"] == "receipt_repair_fetch_granted"
++
++
++def _receipt_call(agent):
++    return SimpleNamespace(id="receipt-9", function=SimpleNamespace(
++        name="terminal",
++        arguments=json.dumps({"command": bound_product_research_receipt_command(agent.session_id), "timeout": 30}),
++    ))
++
++
++def test_controller_fetches_the_official_page_after_the_repair_round(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    prepare_product_research_source_mix(agent, [receipt], messages)  # repair round granted
++
++    # Second unready receipt: the controller searches the candidate's official page.
++    calls, nudge, details = prepare_product_research_source_mix(agent, [_receipt_call(agent)], messages)
++    assert details["mode"] == "controller_official_search" and nudge is None
++    query = json.loads(calls[0].function.arguments)["query"]
++    assert calls[0].function.name == "web_search"
++    assert query.endswith("official product page") and "roborock" in query.lower()
++    assert getattr(agent, "_product_research_receipt_viability_failure_turn_id", None) is None
++
++    official = "https://us.roborock.com/products/roborock-q5-max-plus"
++    review = "https://www.rtings.com/vacuum/reviews/roborock/q5-max-plus"
++    messages = messages + _search_messages(query, [review, official], "9")
++
++    # Whatever the model asks next, the controller extracts the manufacturer result.
++    calls, nudge, details = prepare_product_research_source_mix(agent, [_receipt_call(agent)], messages)
++    assert details["mode"] == "controller_official_extract"
++    assert calls[0].function.name == "web_extract"
++    assert json.loads(calls[0].function.arguments) == {"urls": [official]}
++
++    # No second controller fetch in the same turn.
++    calls, nudge, details = prepare_product_research_source_mix(agent, [_receipt_call(agent)], messages)
++    assert details["mode"] not in {"controller_official_search", "controller_official_extract"}
++
++
++def test_controller_fetch_gives_up_when_no_manufacturer_url_is_found(monkeypatch):
++    monkeypatch.setenv(PRODUCT_RESEARCH_REPAIR_FETCH_ENV, "1")
++    agent, messages, receipt = _exhausted_scenario()
++    prepare_product_research_source_mix(agent, [receipt], messages)
++    calls, _nudge, details = prepare_product_research_source_mix(agent, [_receipt_call(agent)], messages)
++    query = json.loads(calls[0].function.arguments)["query"]
++    messages = messages + _search_messages(query, ["https://www.rtings.com/vacuum/reviews/roborock/q5"], "9")
++
++    calls, nudge, details = prepare_product_research_source_mix(agent, [_receipt_call(agent)], messages)
++    assert details["mode"] != "controller_official_extract"
++    assert agent._product_research_official_fetch_pending is None
++
+-- 
+2.53.0
+
