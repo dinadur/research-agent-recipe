@@ -1,0 +1,166 @@
+From e666161a5f2f7ece75df15d24c69171dd5d6b746 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 22:48:15 +0000
+Subject: [PATCH] B70: travel terminal gate refuses shell expansion; /update
+ off by default
+
+The travel route's terminal gate parsed commands with shlex, which does
+not expand ${IFS} or $VAR, and matched read-only diagnostics by the
+basename of the first word. python3${IFS}-c${IFS}'...'/ls read as one
+word named ls, and the shell ran python3 -c '...'. The gate (and the
+controller timeout policy) now refuse any $, and ls, pwd, stat and
+sha256sum only as bare commands.
+
+gateway.allow_update_command now defaults to false, so a chat /update
+can't move gateway code past the preflight's commit pin unless the
+operator turns it on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D8cFVMg7cafF7yqTTfbLQ4
+---
+ agent/research_contract.py           |  8 ++++++--
+ agent/travel_terminal_policy.py      |  2 +-
+ gateway/config.py                    |  8 +++++---
+ tests/agent/test_travel_route.py     | 24 ++++++++++++++++++++++++
+ tests/gateway/test_config.py         | 13 +++++++++++++
+ tests/gateway/test_update_command.py |  6 +++++-
+ 6 files changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/agent/research_contract.py b/agent/research_contract.py
+index cef1f50505..8640425870 100644
+--- a/agent/research_contract.py
++++ b/agent/research_contract.py
+@@ -245,7 +245,9 @@ _TRAVEL_VAULT_MUTATION_RE = re.compile(
+     r"\b(?:write_text|write_bytes)\s*\(",
+     re.IGNORECASE,
+ )
+-_TRAVEL_SHELL_CONTROL_RE = re.compile(r"&&|\|\||[;&|<>`]|\r|\n|\$\(")
++# Any "$" is refused: shlex.split does not expand ${IFS}, $VAR or $((...)), so a command it reads as one word can be
++# several words, and another program, to the shell that runs it.
++_TRAVEL_SHELL_CONTROL_RE = re.compile(r"&&|\|\||[;&|<>`$]|\r|\n")
+ _TRAVEL_READ_ONLY_COMMANDS = frozenset({"ls", "pwd", "sha256sum", "stat"})
+ _TRAVEL_ROUTE_RESERVATION_LOCK = threading.RLock()
+ # One broad wave (~4 queries) plus one direct-official lookup per venue for the
+@@ -504,7 +506,9 @@ def _travel_route_terminal_command_reason(
+         return message
+     executable = Path(tokens[0]).name
+     if executable in _TRAVEL_READ_ONLY_COMMANDS:
+-        return None
++        # Only the bare command, found on PATH: a path that merely ends in /ls
++        # names whatever program sits there.
++        return None if tokens[0] == executable else message
+     if executable not in {"python", "python3"} or len(tokens) < 2:
+         return message
+ 
+diff --git a/agent/travel_terminal_policy.py b/agent/travel_terminal_policy.py
+index eff10994e7..43b292b25c 100644
+--- a/agent/travel_terminal_policy.py
++++ b/agent/travel_terminal_policy.py
+@@ -13,7 +13,7 @@ import shlex
+ 
+ from hermes_constants import get_hermes_home
+ 
+-_SHELL_CONTROL = re.compile(r"&&|\|\||[;&|<>`]|\r|\n|\$\(")
++_SHELL_CONTROL = re.compile(r"&&|\|\||[;&|<>`$]|\r|\n")
+ _RUNNER_MODULE = "agent.research_harness.travel_runner"
+ _CONTROLLER_NAME = "run_hermes_travel_pipeline.py"
+ _OPTION_LIMITS = {"--max-turns": (1, 4), "--timeout": (1, 600), "--min-included": (1, 12)}
+diff --git a/gateway/config.py b/gateway/config.py
+index 4c25d0d276..04af65bb32 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -514,7 +514,8 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
+ 
+ # Top-level bool-ish keys read verbatim (no nested ``gateway.`` fallback) with their defaults.
+ _TOPLEVEL_BOOL_DEFAULTS = {
+-    "allow_update_command": True,
++    # B70: off unless the operator turns it on, so a chat /update can't move the gateway past the preflight's commit pin.
++    "allow_update_command": False,
+     "write_sessions_json": True, "always_log_local": True, "filter_silence_narration": True,
+     "group_sessions_per_user": True, "thread_sessions_per_user": False,
+ }
+@@ -532,8 +533,9 @@ class GatewayConfig:
+     # compatibility with external tooling and downgrade safety; set gateway.write_sessions_json: false in
+     # config.yaml to stop producing the file.
+     write_sessions_json: bool = True
+-    # Operator-managed installs can prohibit detached, in-place chat updates.
+-    allow_update_command: bool = True
++    # Detached, in-place chat updates (/update). B70: off by default, so code reaches the gateway only through the
++    # operator-managed upgrade workflow and its commit pin; set gateway.allow_update_command: true to allow them.
++    allow_update_command: bool = False
+     always_log_local: bool = True  # Always save cron outputs to local files
+     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
+     # channels; a substrate guard that survives prompt drift.
+diff --git a/tests/agent/test_travel_route.py b/tests/agent/test_travel_route.py
+index 00adfff299..87de33818e 100644
+--- a/tests/agent/test_travel_route.py
++++ b/tests/agent/test_travel_route.py
+@@ -565,6 +565,30 @@ def test_travel_turn_allows_raw_travel_scratch_mutation():
+     assert decision is None
+ 
+ 
++@pytest.mark.parametrize(
++    "command",
++    [
++        # shlex reads one word ending in /ls; the shell runs python3 -c ...
++        "python3${IFS}-c${IFS}'import os;os.system(\"id\")#'/ls",
++        "python3$IFS-c$IFS'print(1)#'/ls",
++        "ls ${HOME}",
++        "ls $((1+1))",
++        "/tmp/anything/ls /opt/research-agent/wiki/raw/travel",
++        "./stat /etc/hostname",
++        "PATH=/tmp ls",
++    ],
++)
++def test_travel_turn_blocks_shell_expansion_and_disguised_read_only_commands(command):
++    agent = SimpleNamespace(
++        _current_turn_id="turn-1",
++        _travel_publication_route_turn_id="turn-1",
++    )
++    decision = before_agent_tool_call(agent, "terminal", {"command": command})
++    assert decision is not None
++    assert decision.code == "travel_publication_terminal_forbidden"
++    assert decision.executed is False
++
++
+ def test_travel_turn_blocks_chained_publisher_bypass():
+     agent = SimpleNamespace(
+         _current_turn_id="turn-1",
+diff --git a/tests/gateway/test_config.py b/tests/gateway/test_config.py
+index d7843f25fb..97dcb73b3c 100644
+--- a/tests/gateway/test_config.py
++++ b/tests/gateway/test_config.py
+@@ -1396,3 +1396,16 @@ class TestB70GatewayConfig:
+         config = load_gateway_config()
+ 
+         assert config.allow_update_command is False
++
++    def test_update_command_is_off_unless_the_operator_turns_it_on(self, tmp_path, monkeypatch):
++        """B70: /update stays off with no setting, and the nested setting can turn it on."""
++        hermes_home = tmp_path / ".hermes"
++        hermes_home.mkdir()
++        config_path = hermes_home / "config.yaml"
++        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++        config_path.write_text("gateway: {}\n", encoding="utf-8")
++        assert load_gateway_config().allow_update_command is False
++
++        config_path.write_text("gateway:\n  allow_update_command: true\n", encoding="utf-8")
++        assert load_gateway_config().allow_update_command is True
+diff --git a/tests/gateway/test_update_command.py b/tests/gateway/test_update_command.py
+index a489a9d2f0..d05480b348 100644
+--- a/tests/gateway/test_update_command.py
++++ b/tests/gateway/test_update_command.py
+@@ -575,4 +575,8 @@ class TestB70GatewayUpdatePolicy:
+         assert denied.to_dict()["allow_update_command"] is False
+ 
+         default = GatewayConfig.from_dict({})
+-        assert default.allow_update_command is True
++        assert default.allow_update_command is False
++        assert GatewayConfig().allow_update_command is False
++
++        allowed = GatewayConfig.from_dict({"allow_update_command": True})
++        assert allowed.allow_update_command is True
+-- 
+2.43.0
+

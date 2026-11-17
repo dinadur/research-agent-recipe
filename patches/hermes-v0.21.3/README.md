@@ -2,7 +2,7 @@
 
 - **Upstream:** https://github.com/NousResearch/hermes-agent (MIT, Nous Research).
 - **Base commit:** `345cd2b057` "chore(release): v0.21.3".
-- **Patches:** 33, in order, produced with `git format-patch`.
+- **Patches:** 34, in order, produced with `git format-patch`.
 
 ## Apply
 
@@ -75,6 +75,7 @@ pinned copy of an external travel-planning skill (`B70_MIGRATION_TRAVEL_PIN`), w
 | 0031 | Product publisher finds drafts stored as text_response(...) | Hermes 0.21 stores the verified draft's exit as `text_response(product_research_verified_draft)`; without this no draft was ever found |
 | 0032 | Controller fetches the missing manufacturer page before withholding | After the repair round, a missing official page is searched and extracted by the controller once per turn, behind the repair-fetch switch |
 | 0033 | Drop leaked planning text from product answers | Working notes and earlier drafts before the final answer are cut; with no clean final draft the answer fails validation |
+| 0034 | Travel terminal gate refuses shell expansion; `/update` off by default | The travel gate refuses any `$` (shlex did not expand `${IFS}`, so `python3${IFS}-c${IFS}'...'/ls` passed as `ls`) and allows ls, pwd, stat and sha256sum only as bare commands; `gateway.allow_update_command` now defaults to false, so a chat `/update` can't move the gateway past the preflight commit pin unless you set it to true |
 
 Each patch's commit message has the evidence behind the change (failing turns, replay counts, test counts).
 
